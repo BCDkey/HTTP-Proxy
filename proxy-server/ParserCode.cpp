@@ -18,6 +18,7 @@
 #include <cstring>
 #include <cstdarg>
 #include <assert.h>
+#include <string.h>
 
 #include <string>
 #include <vector>
@@ -38,7 +39,7 @@ const char* GetWinsockErrorString( int err );
 #endif
 
 
-// ���. �������
+// Доп. функции
 //---------------------------------------------------------------------
 
 
@@ -119,8 +120,8 @@ const char* GetWinsockErrorString( int err )
 
 #endif // WIN32
 
-
-// true, ���� � ������� ���� ������, ��������� ������
+//посмотри разницу структур fd_ в виндах и никсах
+// true, если у соккета есть данные, ожидающие чтения
 bool datawaiting( int sock )
 {
 	fd_set fds;
@@ -134,7 +135,7 @@ bool datawaiting( int sock )
 	int r = select( sock+1, &fds, NULL, NULL, &tv);
 	if (r < 0)
 		BailOnSocketError( "select" );
-
+//переделай под асинхронный вызов
 	if( FD_ISSET( sock, &fds ) )
 		return true;
 	else
@@ -143,13 +144,13 @@ bool datawaiting( int sock )
 
 
 // Попытка вытянуть адрес из строки
-// 0, если не получилось
+// 0, если не вышло
 struct in_addr *atoaddr( const char* address)
 {
 	struct hostent *host;
 	static struct in_addr saddr;
 
-	// First try nnn.nnn.nnn.nnn form
+	// преобразуем IP
 	saddr.s_addr = inet_addr(address);
 	if (saddr.s_addr != -1)
 		return &saddr;
@@ -167,10 +168,7 @@ struct in_addr *atoaddr( const char* address)
 
 
 
-//---------------------------------------------------------------------
-//
-// Exception class
-//
+// Класс исключений
 //---------------------------------------------------------------------
 
 
@@ -190,10 +188,9 @@ Wobbly::Wobbly( const char* fmt, ... )
 
 
 
-
 //---------------------------------------------------------------------
 //
-// Connection
+// класс соединения
 //
 //---------------------------------------------------------------------
 Connection::Connection( const char* host, int port ) :
@@ -208,7 +205,7 @@ Connection::Connection( const char* host, int port ) :
 {
 }
 
-
+//установим колбэки
 void Connection::setcallbacks(
 	ResponseBegin_CB begincb,
 	ResponseData_CB datacb,
@@ -256,7 +253,7 @@ void Connection::close()
 #endif
 	m_Sock = -1;
 
-	// discard any incomplete responses
+	// отмена всех незавершенных ответов
 	while( !m_Outstanding.empty() )
 	{
 		delete m_Outstanding.front();
@@ -277,11 +274,11 @@ void Connection::request( const char* method,
 	int bodysize )
 {
 
-	bool gotcontentlength = false;	// already in headers?
+	bool gotcontentlength = false;	// уже есть среди заголовков?
 
-	// check headers for content-length
-	// TODO: check for "Host" and "Accept-Encoding" too
-	// and avoid adding them ourselves in putrequest()
+	// проверить на наличие заголовка длины содрежимого запроса
+	// TODO: проверить заголовки "Host" и "Accept-Encoding"
+	// и избежать добавления их собой в putrequest()
 	if( headers )
 	{
 		const char** h = headers;
@@ -289,7 +286,7 @@ void Connection::request( const char* method,
 		{
 			const char* name = *h++;
 			const char* value = *h++;
-			assert( value != 0 );	// name with no value!
+			assert( value != 0 );	// имя без значения!
 
 			if( 0==strcasecmp( name, "content-length" ) )
 				gotcontentlength = true;
@@ -332,12 +329,12 @@ void Connection::putrequest( const char* method, const char* url )
 	sprintf( req, "%s %s HTTP/1.1", method, url );
 	m_Buffer.push_back( req );
 
-	putheader( "Host", m_Host.c_str() );	// required for HTTP1.1
+	putheader( "Host", m_Host.c_str() );	// для HTTP1.1
 
-	// don't want any fancy encodings please
+	// неизвестные энкодинги уберем
 	putheader("Accept-Encoding", "identity");
 
-	// Push a new response onto the queue
+	// добавить новый ответ в очередь
 	Response *r = new Response( method, *this );
 	m_Outstanding.push_back( r );
 }
@@ -403,12 +400,12 @@ void Connection::send( const unsigned char* buf, int numbytes )
 void Connection::pump()
 {
 	if( m_Outstanding.empty() )
-		return;		// no requests outstanding
+		return;		// нет необработанных запросов
 
-	assert( m_Sock >0 );	// outstanding requests but no connection!
+	assert( m_Sock >0 );	// запросы есть, коннект сброшен!
 
 	if( !datawaiting( m_Sock ) )
-		return;				// recv will block
+		return;				// запрос будет заблочен
 
 	unsigned char buf[ 2048 ];
 	int a = recv( m_Sock, (char*)buf, sizeof(buf), 0 );
@@ -417,7 +414,7 @@ void Connection::pump()
 
 	if( a== 0 )
 	{
-		// connection has closed
+		// соединение закрыто
 
 		Response* r = m_Outstanding.front();
 		r->notifyconnectionclosed();
@@ -425,7 +422,7 @@ void Connection::pump()
 		delete r;
 		m_Outstanding.pop_front();
 
-		// any outstanding requests will be discarded
+		// любые ждущие запросы будут отброшены
 		close();
 	}
 	else
@@ -437,7 +434,7 @@ void Connection::pump()
 			Response* r = m_Outstanding.front();
 			int u = r->pump( &buf[used], a-used );
 
-			// delete response once completed
+			// удалить завершенный запрос
 			if( r->completed() )
 			{
 				delete r;
@@ -446,10 +443,9 @@ void Connection::pump()
 			used += u;
 		}
 
-		// NOTE: will lose bytes if response queue goes empty
-		// (but server shouldn't be sending anything if we don't have
-		// anything outstanding anyway)
-		assert( used == a );	// all bytes should be used up by here.
+		// Если очередь ответов будет пустой, будут терятся байты
+		// (но сервер не должен отправлять что-либо, если еще есть что-то незавершенное
+		assert( used == a );	// все байты должны быть использованы.
 	}
 }
 
@@ -458,10 +454,7 @@ void Connection::pump()
 
 
 
-//---------------------------------------------------------------------
-//
-// Response
-//
+// класс Response
 //---------------------------------------------------------------------
 
 
@@ -510,18 +503,18 @@ const char* Response::getreason() const
 
 
 
-// Connection has closed
+// Соединение было закрыто
 void Response::notifyconnectionclosed()
 {
 	if( m_State == COMPLETE )
 		return;
 
-	// eof can be valid...
+	// EOF может быть валидным...
 	if( m_State == BODY &&
 		!m_Chunked &&
 		m_Length == -1 )
 	{
-		Finish();	// we're all done!
+		Finish();	// готово!
 	}
 	else
 	{
