@@ -38,7 +38,7 @@ const char* GetWinsockErrorString( int err );
 #endif
 
 
-// Доп. функции
+// пїЅпїЅпїЅ. пїЅпїЅпїЅпїЅпїЅпїЅпїЅ
 //---------------------------------------------------------------------
 
 
@@ -120,7 +120,7 @@ const char* GetWinsockErrorString( int err )
 #endif // WIN32
 
 
-// true, если у соккета есть данные, ожидающие чтения
+// true, пїЅпїЅпїЅпїЅ пїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ, пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ
 bool datawaiting( int sock )
 {
 	fd_set fds;
@@ -142,8 +142,8 @@ bool datawaiting( int sock )
 }
 
 
-// Try to work out address from string
-// returns 0 if bad
+// РџРѕРїС‹С‚РєР° РІС‹С‚СЏРЅСѓС‚СЊ Р°РґСЂРµСЃ РёР· СЃС‚СЂРѕРєРё
+// 0, РµСЃР»Рё РЅРµ РїРѕР»СѓС‡РёР»РѕСЃСЊ
 struct in_addr *atoaddr( const char* address)
 {
 	struct hostent *host;
