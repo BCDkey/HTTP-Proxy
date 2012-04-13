@@ -5,7 +5,7 @@
 	#include <sys/socket.h>
 	#include <netinet/in.h>
 	#include <arpa/inet.h>
-	#include <netdb.h>	// for gethostbyname()
+	#include <netdb.h>	// для gethostbyname()
 	#include <errno.h>
 #endif
 
@@ -488,7 +488,7 @@ const char* Response::getheader( const char* name ) const
 
 int Response::getstatus() const
 {
-	// only valid once we've got the statusline
+	// валидно после получения строки состояния
 	assert( m_State != STATUSLINE );
 	return m_Status;
 }
@@ -496,7 +496,7 @@ int Response::getstatus() const
 
 const char* Response::getreason() const
 {
-	// only valid once we've got the statusline
+	// валидно после получения строки состояния
 	assert( m_State != STATUSLINE );
 	return m_Reason.c_str();
 }
@@ -537,14 +537,14 @@ int Response::pump( const unsigned char* data, int datasize )
 			m_State == CHUNKLEN ||
 			m_State == CHUNKEND )
 		{
-			// we want to accumulate a line
+			// "собираем" строку
 			while( count > 0 )
 			{
 				char c = (char)*data++;
 				--count;
 				if( c == '\n' )
 				{
-					// now got a whole line!
+					// получили всю строку
 					switch( m_State )
 					{
 						case STATUSLINE:
@@ -560,7 +560,7 @@ int Response::pump( const unsigned char* data, int datasize )
 							ProcessChunkLenLine( m_LineBuf );
 							break;
 						case CHUNKEND:
-							// just soak up the crlf after body and go to next state
+							// споймали перевод строки после тела ответа и переход к след. состоянию
 							assert( m_Chunked == true );
 							m_State = CHUNKLEN;
 							break;
@@ -568,11 +568,11 @@ int Response::pump( const unsigned char* data, int datasize )
 							break;
 					}
 					m_LineBuf.clear();
-					break;		// break out of line accumulation!
+					break;		// выйти из генерации строки!
 				}
 				else
 				{
-					if( c != '\r' )		// just ignore CR
+					if( c != '\r' )		// игнорировать возврат каретки
 						m_LineBuf += c;
 				}
 			}
@@ -589,7 +589,7 @@ int Response::pump( const unsigned char* data, int datasize )
 		}
 	}
 
-	// return number of bytes used
+	// число использованных байт
 	return datasize - count;
 }
 
@@ -597,12 +597,12 @@ int Response::pump( const unsigned char* data, int datasize )
 
 void Response::ProcessChunkLenLine( std::string const& line )
 {
-	// chunklen in hex at beginning of line
+	// длина куска в 16-ричной в начале строки
 	m_ChunkLeft = strtol( line.c_str(), NULL, 16 );
 	
 	if( m_ChunkLeft == 0 )
 	{
-		// got the whole body, now check for trailing headers
+		// получили все тело, проверка заголовков-трейлеров
 		m_State = TRAILERS;
 		m_HeaderAccum.clear();
 	}
@@ -613,8 +613,8 @@ void Response::ProcessChunkLenLine( std::string const& line )
 }
 
 
-// handle some body data in chunked mode
-// returns number of bytes used.
+// обработка данных при передаче частями
+// возвращает число байт.
 int Response::ProcessDataChunked( const unsigned char* data, int count )
 {
 	assert( m_Chunked );
@@ -623,7 +623,7 @@ int Response::ProcessDataChunked( const unsigned char* data, int count )
 	if( n>m_ChunkLeft )
 		n = m_ChunkLeft;
 
-	// invoke callback to pass out the data
+	// вызвать колбэк для передачи данных
 	if( m_Connection.m_ResponseDataCB )
 		(m_Connection.m_ResponseDataCB)( this, m_Connection.m_UserData, data, n );
 
@@ -633,32 +633,32 @@ int Response::ProcessDataChunked( const unsigned char* data, int count )
 	assert( m_ChunkLeft >= 0);
 	if( m_ChunkLeft == 0 )
 	{
-		// chunk completed! now soak up the trailing CRLF before next chunk
+		// кусок завершен, пропускаем перевод строки перед трейлерами для следующего куска
 		m_State = CHUNKEND;
 	}
 	return n;
 }
 
-// handle some body data in non-chunked mode.
-// returns number of bytes used.
+// обработка данных при передаче целиком.
+// возвращает число байт.
 int Response::ProcessDataNonChunked( const unsigned char* data, int count )
 {
 	int n = count;
 	if( m_Length != -1 )
 	{
-		// we know how many bytes to expect
+		// число байт известно
 		int remaining = m_Length - m_BytesRead;
 		if( n > remaining )
 			n = remaining;
 	}
 
-	// invoke callback to pass out the data
+	// вызов колбэка для передачи данных
 	if( m_Connection.m_ResponseDataCB )
 		(m_Connection.m_ResponseDataCB)( this, m_Connection.m_UserData, data, n );
 
 	m_BytesRead += n;
 
-	// Finish if we know we're done. Else we're waiting for connection close.
+	// Заканчиваем, если все готово или ждем разрыва соединения
 	if( m_Length != -1 && m_BytesRead == m_Length )
 		Finish();
 
@@ -670,7 +670,7 @@ void Response::Finish()
 {
 	m_State = COMPLETE;
 
-	// invoke the callback
+	// вызов колбэков
 	if( m_Connection.m_ResponseCompleteCB )
 		(m_Connection.m_ResponseCompleteCB)( this, m_Connection.m_UserData );
 }
@@ -680,24 +680,24 @@ void Response::ProcessStatusLine( std::string const& line )
 {
 	const char* p = line.c_str();
 
-	// skip any leading space
+	// пропустить любые предшествующие пробелы
 	while( *p && *p == ' ' )
 		++p;
 
-	// get version
+	// версия протокола
 	while( *p && *p != ' ' )
 		m_VersionString += *p++;
 	while( *p && *p == ' ' )
 		++p;
 
-	// get status code
+	// статус-код
 	std::string status;
 	while( *p && *p != ' ' )
 		status += *p++;
 	while( *p && *p == ' ' )
 		++p;
 
-	// rest of line is reason
+	// остальное - строка причины
 	while( *p )
 		m_Reason += *p++;
 
@@ -717,20 +717,20 @@ void Response::ProcessStatusLine( std::string const& line )
 		m_Version = 11;
 	else
 		throw Wobbly( "UnknownProtocol (%s)", m_VersionString.c_str() );
-	// TODO: support for HTTP/0.9
+	// HTTP/0.9 не поддерживает
 
 	
-	// OK, now we expect headers!
+	// теперь идут заголовки
 	m_State = HEADERS;
 	m_HeaderAccum.clear();
 }
 
 
-// process accumulated header data
+// обработка данных заголовка
 void Response::FlushHeader()
 {
 	if( m_HeaderAccum.empty() )
-		return;	// no flushing required
+		return;	// не нужна
 
 	const char* p = m_HeaderAccum.c_str();
 
@@ -739,15 +739,15 @@ void Response::FlushHeader()
 	while( *p && *p != ':' )
 		header += tolower( *p++ );
 
-	// skip ':'
+	// пропуск ':'
 	if( *p )
 		++p;
 
-	// skip space
+	// пропуск пробелов
 	while( *p && (*p ==' ' || *p=='\t') )
 		++p;
 
-	value = p; // rest of line is value
+	value = p; // остальная часть строки - значение
 
 	m_Headers[ header ] = value;
 //	printf("header: ['%s': '%s']\n", header.c_str(), value.c_str() );	
@@ -762,19 +762,19 @@ void Response::ProcessHeaderLine( std::string const& line )
 	if( line.empty() )
 	{
 		FlushHeader();
-		// end of headers
+		// конец заголовков
 
-		// HTTP code 100 handling (we ignore 'em)
+		// код 100 игнорируется
 		if( m_Status == CONTINUE )
-			m_State = STATUSLINE;	// reset parsing, expect new status line
+			m_State = STATUSLINE;	// сброс парсинга и ожидание новой строки состояния
 		else
-			BeginBody();			// start on body now!
+			BeginBody();			// обработка тела ответа
 		return;
 	}
 
 	if( isspace(*p) )
 	{
-		// it's a continuation line - just add it to previous data
+		// строка продолжения - добавить к предшествующим данным
 		++p;
 		while( *p && isspace( *p ) )
 			++p;
@@ -784,7 +784,7 @@ void Response::ProcessHeaderLine( std::string const& line )
 	}
 	else
 	{
-		// begin a new header
+		// взять новый заголовок
 		FlushHeader();
 		m_HeaderAccum = p;
 	}
@@ -793,61 +793,58 @@ void Response::ProcessHeaderLine( std::string const& line )
 
 void Response::ProcessTrailerLine( std::string const& line )
 {
-	// TODO: handle trailers?
-	// (python httplib doesn't seem to!)
+	// Сделать: обработка доп. заголовков	
 	if( line.empty() )
 		Finish();
 
-	// just ignore all the trailers...
+	// просто игнорируем доп. заголовки
 }
 
 
 
-// OK, we've now got all the headers read in, so we're ready to start
-// on the body. But we need to see what info we can glean from the headers
-// first...
+// Сперва проверка информации, полученной из заголовков, затем - переход к разбору тела ответа
 void Response::BeginBody()
 {
 
 	m_Chunked = false;
-	m_Length = -1;	// unknown
+	m_Length = -1;	// неизвестна
 	m_WillClose = false;
 
-	// using chunked encoding?
+	// используется кодировка?
 	const char* trenc = getheader( "transfer-encoding" );
 	if( trenc && 0==strcasecmp( trenc, "chunked") )
 	{
 		m_Chunked = true;
-		m_ChunkLeft = -1;	// unknown
+		m_ChunkLeft = -1;	// неизвестно
 	}
 
 	m_WillClose = CheckClose();
 
-	// length supplied?
+	// задана длина?
 	const char* contentlen = getheader( "content-length" );
 	if( contentlen && !m_Chunked )
 	{
 		m_Length = atoi( contentlen );
 	}
 
-	// check for various cases where we expect zero-length body
+	// проверка состояний, при которых ожидается нулевой объем данных
 	if( m_Status == NO_CONTENT ||
 		m_Status == NOT_MODIFIED ||
-		( m_Status >= 100 && m_Status < 200 ) ||		// 1xx codes have no body
+		( m_Status >= 100 && m_Status < 200 ) ||		// 1xx коды без тела ответа
 		m_Method == "HEAD" )
 	{
 		m_Length = 0;
 	}
 
 
-	// if we're not using chunked mode, and no length has been specified,
-	// assume connection will close at end.
+	// если не используется частичная передача и длина не была определена,
+	// убедится, что соединение будет разорвано.
 	if( !m_WillClose && !m_Chunked && m_Length == -1 )
 		m_WillClose = true;
 
 
 
-	// Invoke the user callback, if any
+	// вызвов пользовательских колбэков, если есть
 	if( m_Connection.m_ResponseBeginCB )
 		(m_Connection.m_ResponseBeginCB)( this, m_Connection.m_UserData );
 
@@ -859,7 +856,7 @@ void Response::BeginBody()
 	printf("ChunkLeft: %d\n", (int)m_ChunkLeft );
 	printf("----------------------------\n");
 */
-	// now start reading body data!
+	// чтение данных тела
 	if( m_Chunked )
 		m_State = CHUNKLEN;
 	else
@@ -867,13 +864,13 @@ void Response::BeginBody()
 }
 
 
-// return true if we think server will automatically close connection
+// true, если сервер сам разорвет соединение
 bool Response::CheckClose()
 {
 	if( m_Version == 11 )
 	{
 		// HTTP1.1
-		// the connection stays open unless "connection: close" is specified.
+		// соединение открыто, даже если "connection: close" определено.
 		const char* conn = getheader( "connection" );
 		if( conn && 0==strcasecmp( conn, "close" ) )
 			return true;
@@ -881,17 +878,13 @@ bool Response::CheckClose()
 			return false;
 	}
 
-	// Older HTTP
-	// keep-alive header indicates persistant connection 
+	// более старые версии HTTP
+	// keep-alive заголовок указывает на постоянное соединение 
 	if( getheader( "keep-alive" ) )
-		return false;
-
-	// TODO: some special case handling for Akamai and netscape maybe?
-	// (see _check_close() in python httplib.py for details)
-
+		return false;	
 	return true;
 }
 
 
 
-}	// end namespace httpparser
+}	// конец пространства имен
