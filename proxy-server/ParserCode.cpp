@@ -1,32 +1,36 @@
-#include "httpparser.h"
+#include "ParserHeader.h"
 
 #ifndef WIN32
 //	#include <sys/types.h>
 	#include <sys/socket.h>
 	#include <netinet/in.h>
 	#include <arpa/inet.h>
-	#include <netdb.h>	// РґР»СЏ gethostbyname()
+	//#include <afxwin.h>
+	//#include <afxcmn.h>
+	#include <netdb.h>	// для gethostbyname()
 	#include <errno.h>
 #endif
 
-#ifdef WIN32
+/*#ifdef WIN32
 	#include <winsock2.h>
 	#define vsnprintf _vsnprintf
-#endif
-
+#endif*/
+//#include <afxwin.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdarg>
 #include <assert.h>
+#include <iostream>
 #include <string.h>
-
+//#include <windows.h>
 #include <string>
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <iphlpapi.h>
 
-
-
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment (lib, "iphlpapi")
 
 using namespace std;
 
@@ -34,15 +38,20 @@ using namespace std;
 namespace httpparser
 {
 
+//кэш: первая строка - url+пару заголовков, вторая строка - ответ сервера, третяя строка - имя файла на проксе
+std::map< std::map< std::vector<std::string>, std::string>, std::string > cache;
+HANDLE general_mutex[6];
+DWORD retcode = 3;
+//число подключенных пользователей
+long number_of_connections;
+
 #ifdef WIN32
 const char* GetWinsockErrorString( int err );
 #endif
 
-
-// Р”РѕРї. С„СѓРЅРєС†РёРё
+class Connection;
+// Доп. функции
 //---------------------------------------------------------------------
-
-
 
 void BailOnSocketError( const char* context )
 {
@@ -53,7 +62,10 @@ void BailOnSocketError( const char* context )
 #else
 	const char* msg = strerror( errno );
 #endif
-	throw Wobbly( "%s: %s", context, msg );
+	WaitForSingleObject(general_mutex[0], INFINITE);
+	cout<<context<<msg<<endl;
+	ReleaseMutex(general_mutex[0]);
+//	throw Wobbly( "%s: %s", context, msg );
 }
 
 
@@ -120,8 +132,8 @@ const char* GetWinsockErrorString( int err )
 
 #endif // WIN32
 
-//РїРѕСЃРјРѕС‚СЂРё СЂР°Р·РЅРёС†Сѓ СЃС‚СЂСѓРєС‚СѓСЂ fd_ РІ РІРёРЅРґР°С… Рё РЅРёРєСЃР°С…
-// true, РµСЃР»Рё Сѓ СЃРѕРєРєРµС‚Р° РµСЃС‚СЊ РґР°РЅРЅС‹Рµ, РѕР¶РёРґР°СЋС‰РёРµ С‡С‚РµРЅРёСЏ
+//посмотри разницу структур fd_ в виндах и никсах
+// true, если у соккета есть данные, ожидающие чтения
 bool datawaiting( int sock )
 {
 	fd_set fds;
@@ -134,8 +146,9 @@ bool datawaiting( int sock )
 
 	int r = select( sock+1, &fds, NULL, NULL, &tv);
 	if (r < 0)
+	{
 		BailOnSocketError( "select" );
-//РїРµСЂРµРґРµР»Р°Р№ РїРѕРґ Р°СЃРёРЅС…СЂРѕРЅРЅС‹Р№ РІС‹Р·РѕРІ
+	}
 	if( FD_ISSET( sock, &fds ) )
 		return true;
 	else
@@ -143,14 +156,14 @@ bool datawaiting( int sock )
 }
 
 
-// РџРѕРїС‹С‚РєР° РІС‹С‚СЏРЅСѓС‚СЊ Р°РґСЂРµСЃ РёР· СЃС‚СЂРѕРєРё
-// 0, РµСЃР»Рё РЅРµ РІС‹С€Р»Рѕ
+// Попытка вытянуть адрес из строки
+// 0, если не вышло
 struct in_addr *atoaddr( const char* address)
 {
 	struct hostent *host;
 	static struct in_addr saddr;
 
-	// РїСЂРµРѕР±СЂР°Р·СѓРµРј IP
+	// преобразуем IP
 	saddr.s_addr = inet_addr(address);
 	if (saddr.s_addr != -1)
 		return &saddr;
@@ -162,13 +175,244 @@ struct in_addr *atoaddr( const char* address)
 	return 0;
 }
 
+void OnBeginm( const httpparser::Response* r, void* userdata )
+{
+	//WaitForSingleObject(general_mutex[0], INFINITE);
+	int got;
+	r->getconnection()->createresponse(r);
+	int len = r->getconnection()->get_resp_done().size();
+	char *buf = (char*)malloc(len*sizeof(char));
+	strcpy(buf, r->getconnection()->get_resp_done().c_str());
+	got = ::send(r->getconnection()->getsock_2(), (const char*)buf, len, 0);
+	if( got < 0 )
+	{
+		BailOnSocketError(" send() ");
+		r->getconnection()->close();
+		httpparser::number_of_connections--;
+		ExitThread(retcode);
+	}
+	//ReleaseMutex(general_mutex[0]);
+	//printf( "BEGIN (%d %s)\n", r->getstatus(), r->getreason() );
+	//count = 0;
+}
 
+void OnDatam( const httpparser::Response* r, void* userdata, const unsigned char* data, int n )
+{
+	//WaitForSingleObject(general_mutex[1], INFINITE);
+	int got;
+	//const char* buf = reinterpret_cast <const char*> (data);
+	got = ::send(r->getconnection()->getsock_2(), (const char*)data, n, 0);
+	if( got < 0 )
+	{
+		BailOnSocketError(" send() ");
+		r->getconnection()->close();
+		httpparser::number_of_connections--;
+		ExitThread(retcode);
+	}
+	//fwrite( data,1,n, pFile );
+	//count += n;
+	//if(n!=2048)
+	//	count+=n;
+	//ReleaseMutex(general_mutex[1]);
+}
 
+void OnCompletem( const httpparser::Response* r, void* userdata )
+{
+	//printf( "COMPLETE (%d bytes)\n", count );
+}
 
+void OnBeginr( const httpparser::Request* r, void* userdata )
+{
+	//WaitForSingleObject(general_mutex[2],INFINITE);
+	int got;
+	//const Request *req = r;
+	r->getconnection()->createrequest(r);
+	r->getconnection()->connect();
+	int len = r->getconnection()->get_req_done().size();
+	char *buf = (char*)malloc(len*sizeof(char));
+	strcpy(buf, r->getconnection()->get_req_done().c_str());
+	SOCKET sock = r->getconnection()->getsock_1();
+	got = ::send(r->getconnection()->getsock_1(), (const char*)buf, len, 0);
+	if( got < 0 )
+	{
+		BailOnSocketError(" send() ");
+		r->getconnection()->close();
+		httpparser::number_of_connections--;
+		ExitThread(retcode);
+	}
+	//Response *resp = new Response //(r->r_Method, r->getconnection()
+	//printf( "BEGIN (%d %s)\n", r->getstatus(), r->getreason() );
+	//count = 0;
+	//ReleaseMutex(general_mutex[2]);
+}
 
+void OnDatar( const httpparser::Request* r, void* userdata, const unsigned char* data, int n )
+{
+	//WaitForSingleObject(general_mutex[3],INFINITE);
+	int got;
+	const char* buf = reinterpret_cast <const char*> (data);
+	got = ::send(r->getconnection()->getsock_1(), buf, n, 0);
+	if( got < 0 )
+	{
+		BailOnSocketError(" send() ");
+		r->getconnection()->close();
+		httpparser::number_of_connections--;
+		ExitThread(retcode);
+	}
+	//fwrite( data,1,n, pFile );
+	//count += n;
+	//if(n!=2048)
+	//	count+=n;
+	//ReleaseMutex(general_mutex[3]);
+}
 
+void OnCompleter( const httpparser::Request* r, void* userdata )
+{
+	//printf( "COMPLETE (%d bytes)\n", count );
+}
 
-// РљР»Р°СЃСЃ РёСЃРєР»СЋС‡РµРЅРёР№
+//Класс сервера
+//---------------------------------------------------------------------
+
+ProxyServer::ProxyServer(int onport) :
+port (onport),
+number_of_connections (100)
+{
+	local_addr.sin_family = AF_INET;
+	local_addr.sin_port = htons(onport);
+	local_addr.sin_addr.s_addr = htonl (INADDR_ANY);
+	mysocket = socket( AF_INET, SOCK_STREAM, 0 );
+	if( mysocket < 0 )
+		BailOnSocketError( "socket()" );
+	for each(HANDLE ha in general_mutex)
+	{
+		ha = INVALID_HANDLE_VALUE;
+	}
+}
+
+void ProxyServer::whatismyIP()
+{
+	//using std::cout;
+	//using std::cerr;
+	using std::endl;
+
+	char* buf;
+	PIP_ADAPTER_INFO pAdaptersInfo;
+	PIP_ADDR_STRING pAddr;
+	DWORD dwSize = 0;
+
+	if(GetAdaptersInfo(NULL, &dwSize) != ERROR_BUFFER_OVERFLOW)
+	{
+		cerr << "GetAdaptersInfo fail" << endl;
+		return;
+	}
+	buf = new char[dwSize];
+	if (!buf) return;
+	pAdaptersInfo = reinterpret_cast<PIP_ADAPTER_INFO>(buf);
+	if (GetAdaptersInfo (pAdaptersInfo, &dwSize) == ERROR_SUCCESS){
+		while (pAdaptersInfo){
+			pAddr = &pAdaptersInfo->IpAddressList;
+			while (pAddr){
+				cout <<"\nAddress: " << pAddr->IpAddress.String << "/" << 
+					pAddr->IpMask.String << endl;
+				pAddr = pAddr->Next;
+			}
+			pAdaptersInfo = pAdaptersInfo->Next;
+		}
+	}
+	delete[] buf;
+}
+
+void ProxyServer::bind_this_port()
+{
+	//bind( mysocket,(LPSOCKADDR)&local_addr, sizeof(struct sockaddr) );
+	if (bind(mysocket, (sockaddr *)&local_addr, sizeof(struct sockaddr)))
+     {
+         // Ошибка
+         printf("Error bind %d\n", WSAGetLastError());
+         closesocket(mysocket); // закрываем сокет!
+         WSACleanup();         
+     }
+	if (listen(mysocket, number_of_connections))
+     {
+         // Ошибка
+         printf("Error listen %d\n", WSAGetLastError());
+         closesocket(mysocket);
+         WSACleanup();         
+     }	
+}
+
+ProxyServer::~ProxyServer()
+{
+	close();
+}
+
+void ProxyServer::keepconnections()
+{
+	int temp_sock;
+	for each (HANDLE h in this->HANDLES)
+		h = INVALID_HANDLE_VALUE;
+	sockaddr_in client_addr;
+	int client_addr_size = sizeof(client_addr);
+	for(int i = 0; i<6 ; i++)
+	{
+		general_mutex[i] = CreateMutexA(NULL, false, NULL);
+	}
+	while(1)
+	{
+		if(!datawaiting(this->mysocket))
+			continue;
+		while(temp_sock = ::accept(mysocket, (sockaddr *)&client_addr, 
+			&client_addr_size))
+		{
+			httpparser::number_of_connections++;
+			WaitForSingleObject(general_mutex[0], INFINITE);
+			cout<<httpparser::number_of_connections<<endl;
+			//close();
+			ReleaseMutex(general_mutex[0]);
+			Connection *conn = new Connection("",80,"");
+			conn->setsock_2(temp_sock);
+			conn->setport_2(ntohs(client_addr.sin_port));
+			//DWORD thID;
+			for (int i = 0;i < 100; i++)
+				if( GetExitCodeThread(HANDLES[i], &retcode) == 0)
+				{
+					HANDLES[i] = CreateThread(NULL, NULL, NewConnection, (LPVOID)conn, NULL, NULL);	
+					break;
+				}
+		}
+	}
+}
+
+DWORD WINAPI NewConnection(LPVOID connection)
+{
+	Connection *conn = (Connection*)connection;
+	conn->setcallbacks(OnBeginm, OnDatam, OnCompletem, 0, OnBeginr, OnDatar, OnCompleter, 0);
+	while(!conn->getrout().empty() || conn->first() == true)
+	{
+		conn->pump();
+	}
+	return 0;
+}
+void ProxyServer::close()
+{
+#ifdef WIN32
+	if( mysocket >= 0 )
+		::closesocket( mysocket );	
+#else
+	if( mysocket >= 0 )
+		::close( mysocket );	
+#endif
+	mysocket = -1;
+	for each(HANDLE ha in general_mutex)
+	{
+		if(httpparser::general_mutex!=INVALID_HANDLE_VALUE)
+		CloseHandle(httpparser::general_mutex);
+	}
+
+	httpparser::cache.clear();	
+}
+// Класс исключений
 //---------------------------------------------------------------------
 
 
@@ -190,41 +434,73 @@ Wobbly::Wobbly( const char* fmt, ... )
 
 //---------------------------------------------------------------------
 //
-// РєР»Р°СЃСЃ СЃРѕРµРґРёРЅРµРЅРёСЏ
+// класс соединения
 //
 //---------------------------------------------------------------------
-Connection::Connection( const char* host, int port ) :
+Connection::Connection( const char* host, int port, const char* version ) :
 	m_ResponseBeginCB(0),
 	m_ResponseDataCB(0),
 	m_ResponseCompleteCB(0),
+	r_RequestBeginCB(0),
+	r_RequestDataCB(0),
+	r_RequestCompleteCB(0),
+	r_UserData(0),
 	m_UserData(0),
 	m_State( IDLE ),
+	first_time_connection (true),
+	resp_State ( NONE),
+	m_Version ( version ),
 	m_Host( host ),
 	m_Port( port ),
-	m_Sock(-1)
+	m_Sock(-1),
+	m2_Sock(-1),
+	m2_Port( 0 ),
+	gotacceptencoding ( false ),
+	gothost ( false ),
+	response_or_request( REQ )
 {
 }
 
-//СѓСЃС‚Р°РЅРѕРІРёРј РєРѕР»Р±СЌРєРё
+//установим колбэки
 void Connection::setcallbacks(
-	ResponseBegin_CB begincb,
-	ResponseData_CB datacb,
-	ResponseComplete_CB completecb,
-	void* userdata )
+	ResponseBegin_CB begincbm,
+	ResponseData_CB datacbm,
+	ResponseComplete_CB completecbm,
+	void* userdatam,
+	RequestBegin_CB begincbr,
+	RequestData_CB datacbr,
+	RequestComplete_CB completecbr,
+	void* userdatar)
 {
-	m_ResponseBeginCB = begincb;
-	m_ResponseDataCB = datacb;
-	m_ResponseCompleteCB = completecb;
-	m_UserData = userdata;
+	m_ResponseBeginCB = begincbm;
+	m_ResponseDataCB = datacbm;
+	m_ResponseCompleteCB = completecbm;
+	m_UserData = userdatam;
+	r_RequestBeginCB = begincbr;
+	r_RequestDataCB = datacbr;
+	r_RequestCompleteCB = completecbr;
+	r_UserData = userdatar;
+	/*if(this->first_time_connection)
+	{
+		Request *req = new Request(*this);
+		this->r_Outstanding.push_back(req);
+	}*/
 }
 
-
+//ИСПОЛЬЗУЙ ЕГО ДЛЯ КОННЕКТА, КОГДА БУДЕТ ГОТОВ ЗАПРОС В ПАМПЕ
 void Connection::connect()
 {
 	in_addr* addr = atoaddr( m_Host.c_str() );
 	if( !addr )
-		throw Wobbly( "Invalid network address" );
-
+	{
+		WaitForSingleObject(general_mutex[0], INFINITE);
+		cout<<"Invalid network address"<<endl;
+		close();
+		ReleaseMutex(general_mutex[0]);
+		httpparser::number_of_connections--;
+		ExitThread(retcode);
+		//throw Wobbly( "Invalid network address" );
+	}
 	sockaddr_in address;
 	memset( (char*)&address, 0, sizeof(address) );
 	address.sin_family = AF_INET;
@@ -233,12 +509,21 @@ void Connection::connect()
 
 	m_Sock = socket( AF_INET, SOCK_STREAM, 0 );
 	if( m_Sock < 0 )
+	{
 		BailOnSocketError( "socket()" );
-
+		close();
+		httpparser::number_of_connections--;
+		ExitThread(retcode);
+	}
 //	printf("Connecting to %s on port %d.\n",inet_ntoa(*addr), port);
 
 	if( ::connect( m_Sock, (sockaddr const*)&address, sizeof(address) ) < 0 )
+	{
 		BailOnSocketError( "connect()" );
+		close();
+		httpparser::number_of_connections--;
+		ExitThread(retcode);
+	}
 }
 
 
@@ -247,17 +532,26 @@ void Connection::close()
 #ifdef WIN32
 	if( m_Sock >= 0 )
 		::closesocket( m_Sock );
+	if( m2_Sock >= 0 )
+		::closesocket( m_Sock );
 #else
 	if( m_Sock >= 0 )
 		::close( m_Sock );
+	if( m2_Sock >= 0 )
+		::close( m2_Sock );
 #endif
 	m_Sock = -1;
-
-	// РѕС‚РјРµРЅР° РІСЃРµС… РЅРµР·Р°РІРµСЂС€РµРЅРЅС‹С… РѕС‚РІРµС‚РѕРІ
+	m2_Sock = -1;
+	// отмена всех незавершенных ответов
 	while( !m_Outstanding.empty() )
 	{
 		delete m_Outstanding.front();
 		m_Outstanding.pop_front();
+	}
+	while( !r_Outstanding.empty() )
+	{
+		delete r_Outstanding.front();
+		r_Outstanding.pop_front();
 	}
 }
 
@@ -274,11 +568,11 @@ void Connection::request( const char* method,
 	int bodysize )
 {
 
-	bool gotcontentlength = false;	// СѓР¶Рµ РµСЃС‚СЊ СЃСЂРµРґРё Р·Р°РіРѕР»РѕРІРєРѕРІ?
+	bool gotcontentlength = false;	// уже есть среди заголовков?
 
-	// РїСЂРѕРІРµСЂРёС‚СЊ РЅР° РЅР°Р»РёС‡РёРµ Р·Р°РіРѕР»РѕРІРєР° РґР»РёРЅС‹ СЃРѕРґСЂРµР¶РёРјРѕРіРѕ Р·Р°РїСЂРѕСЃР°
-	// TODO: РїСЂРѕРІРµСЂРёС‚СЊ Р·Р°РіРѕР»РѕРІРєРё "Host" Рё "Accept-Encoding"
-	// Рё РёР·Р±РµР¶Р°С‚СЊ РґРѕР±Р°РІР»РµРЅРёСЏ РёС… СЃРѕР±РѕР№ РІ putrequest()
+	// проверить на наличие заголовка длины содрежимого запроса
+	// TODO: проверить заголовки "Host" и "Accept-Encoding"
+	// и избежать добавления их собой в putrequest()
 	if( headers )
 	{
 		const char** h = headers;
@@ -286,10 +580,14 @@ void Connection::request( const char* method,
 		{
 			const char* name = *h++;
 			const char* value = *h++;
-			assert( value != 0 );	// РёРјСЏ Р±РµР· Р·РЅР°С‡РµРЅРёСЏ!
+			assert( value != 0 );	// имя без значения!
 
-			if( 0==strcasecmp( name, "content-length" ) )
+			if( 0==strcmpi( name, "content-length" ) )
 				gotcontentlength = true;
+			if( 0==strcmpi( name, "accept-encoding" ) )
+				this->gotacceptencoding = true;
+			if( 0==strcmpi( name, "host" ) )
+				this->gothost = true;
 		}
 	}
 
@@ -315,9 +613,38 @@ void Connection::request( const char* method,
 
 }
 
+void Connection::response( const char* version, const char* reason, const char* status,	const char* headers[],
+	const unsigned char* body, int bodysize )
+{
+	putresponse( version, reason, status );	
 
+	if( headers )
+	{
+		const char** h = headers;
+		while( *h )
+		{
+			const char* name = *h++;
+			const char* value = *h++;
+			putheader( name, value );
+		}
+	}
+	endheaders();
 
+	if( body )
+		send( body, bodysize );
+}
 
+void Connection::putresponse(const char* version, const char* reason, const char* status)
+{
+	if( m_State != IDLE )
+		throw Wobbly( "Response already issued" );
+	m_State = REQ_STARTED;
+	char req[ 2048 ];
+	sprintf( req, "%s %s %s", version, reason, status );
+	r_Buffer.push_back( req );
+	/*Request *r = new Request(*this);
+	r_Outstanding.push_back(r);*/
+}
 void Connection::putrequest( const char* method, const char* url )
 {
 	if( m_State != IDLE )
@@ -325,16 +652,16 @@ void Connection::putrequest( const char* method, const char* url )
 
 	m_State = REQ_STARTED;
 
-	char req[ 512 ];
-	sprintf( req, "%s %s HTTP/1.1", method, url );
+	char req[ 2048 ];
+	sprintf( req, "%s %s %s", method, url, m_Version.c_str() );
 	m_Buffer.push_back( req );
-
-	putheader( "Host", m_Host.c_str() );	// РґР»СЏ HTTP1.1
-
-	// РЅРµРёР·РІРµСЃС‚РЅС‹Рµ СЌРЅРєРѕРґРёРЅРіРё СѓР±РµСЂРµРј
+	if(!gothost)
+	putheader( "Host", m_Host.c_str() );	// для HTTP1.1
+	if(!gotacceptencoding)
+	// неизвестные энкодинги уберем
 	putheader("Accept-Encoding", "identity");
 
-	// РґРѕР±Р°РІРёС‚СЊ РЅРѕРІС‹Р№ РѕС‚РІРµС‚ РІ РѕС‡РµСЂРµРґСЊ
+	// добавить новый ответ в очередь
 	Response *r = new Response( method, *this );
 	m_Outstanding.push_back( r );
 }
@@ -344,7 +671,10 @@ void Connection::putheader( const char* header, const char* value )
 {
 	if( m_State != REQ_STARTED )
 		throw Wobbly( "putheader() failed" );
+	if(response_or_request==REQ)
 	m_Buffer.push_back( string(header) + ": " + string( value ) );
+	else
+		r_Buffer.push_back( string(header) + ": " + string( value ) );
 }
 
 void Connection::putheader( const char* header, int numericvalue )
@@ -359,93 +689,238 @@ void Connection::endheaders()
 	if( m_State != REQ_STARTED )
 		throw Wobbly( "Cannot send header" );
 	m_State = IDLE;
-
-	m_Buffer.push_back( "" );
-
+	
 	string msg;
-	vector< string>::const_iterator it;
-	for( it = m_Buffer.begin(); it != m_Buffer.end(); ++it )
-		msg += (*it) + "\r\n";
 
-	m_Buffer.clear();
+	if( response_or_request == REQ )
+	{
+		m_Buffer.push_back( "" );
+		vector< string>::const_iterator it;
+		for( it = m_Buffer.begin(); it != m_Buffer.end(); ++it )
+			msg += (*it) + "\r\n";
 
+		m_Buffer.clear();
+		this->req_done = msg;
+	}
+	else
+	{
+		r_Buffer.push_back( "" );
+		vector< string>::const_iterator it;
+		for( it = r_Buffer.begin(); it != r_Buffer.end(); ++it )
+			msg += (*it) + "\r\n";
+
+		r_Buffer.clear();
+		this->resp_done = msg;
+	}	
 //	printf( "%s", msg.c_str() );
-	send( (const unsigned char*)msg.c_str(), msg.size() );
+	//send( (const unsigned char*)msg.c_str(), msg.size() );
 }
 
 
-
+//ВРЯД ЛИ БУДЕШЬ ВООБЩЕ ЕГО ЮЗАТЬ, ДЕЛАЙ ОТПРАВКУ ДАННЫХ И ЗАПРОСА НАПРЯМУЮ В СОККЕТ В КОЛБЭКАХ
 void Connection::send( const unsigned char* buf, int numbytes )
 {
 //	fwrite( buf, 1,numbytes, stdout );
-	
-	if( m_Sock < 0 )
+	int *sock = &m2_Sock;
+	if( response_or_request == REQ )
+		sock = &m_Sock;
+	if( *sock < 0 )
 		connect();
 
 	while( numbytes > 0 )
 	{
 #ifdef WIN32
-		int n = ::send( m_Sock, (const char*)buf, numbytes, 0 );
+		int n = ::send( *sock, (const char*)buf, numbytes, 0 );
 #else
-		int n = ::send( m_Sock, buf, numbytes, 0 );
+		int n = ::send( *sock, buf, numbytes, 0 );
 #endif
 		if( n<0 )
+		{
 			BailOnSocketError( "send()" );
+			close();
+			httpparser::number_of_connections--;
+			ExitThread(retcode);
+		}
 		numbytes -= n;
 		buf += n;
 	}
 }
 
+void Connection::createresponse(const Response* r)
+{
+	this->response_or_request= RESP;
+	if( resp_State != NONE )
+		return;
 
+	resp_State = DONE;
+	char dest[4];
+	string msg = r->m_VersionString;
+	msg+= " ";
+	string status = itoa(r->m_Status, dest, 10);
+	msg+= status;
+	msg+= " ";
+	msg+= r->m_Reason;
+	msg+= "\r\n";
+	std::map<std::string, std::string>::const_iterator it;
+	for( it = r->m_Headers.begin(); it != r->m_Headers.end(); ++it )
+		msg += it->first + ": " + it->second + "\r\n";
+	msg+="\r\n";
+	this->resp_done = msg;
+}
+//ДОДЕЛАЙ ЭТУ ХЕРНЮ И СДЕЛАЙ ШТУЧКУ С ХОСТОМ
+void Connection::createrequest(const Request* r)
+{
+	this->response_or_request = REQ;
+	std::vector<std::string>::const_iterator it;
+	bool ishost = false;
+	for(it = r->r_Headers.begin(); it != r->r_Headers.end();++it)
+	{
+		if(ishost) { this->m_Host += it->data(); ishost = false;}
+		if( 0==strcmpi( it->data(), "Host" ) )
+		{ishost=true; this->gothost=true;}
+		if( 0==strcmpi( it->data(), "Accept-Encoding" ) ) this->gotacceptencoding = true;
+	}
+	this->m_Version = r->r_VersionString;
+	this->putrequest( r->r_Method.c_str(), r->r_URL.c_str() );
+	for( it = r->r_Headers.begin(); it != r->r_Headers.end();++it)
+	{
+		const char *buf = it->data();
+		it++;
+		if(buf=="Content-Length")
+		{
+			int bodysize = atoi(it->data());
+			this->putheader(buf, bodysize);
+			continue;
+		}		
+		this->putheader(buf, it->data());
+	}
+	endheaders();
+}
 void Connection::pump()
 {
-	if( m_Outstanding.empty() )
-		return;		// РЅРµС‚ РЅРµРѕР±СЂР°Р±РѕС‚Р°РЅРЅС‹С… Р·Р°РїСЂРѕСЃРѕРІ
-
-	assert( m_Sock >0 );	// Р·Р°РїСЂРѕСЃС‹ РµСЃС‚СЊ, РєРѕРЅРЅРµРєС‚ СЃР±СЂРѕС€РµРЅ!
-
-	if( !datawaiting( m_Sock ) )
-		return;				// Р·Р°РїСЂРѕСЃ Р±СѓРґРµС‚ Р·Р°Р±Р»РѕС‡РµРЅ
-
-	unsigned char buf[ 2048 ];
-	int a = recv( m_Sock, (char*)buf, sizeof(buf), 0 );
-	if( a<0 )
-		BailOnSocketError( "recv()" );
-
-	if( a== 0 )
+	if(first_time_connection == true)
 	{
-		// СЃРѕРµРґРёРЅРµРЅРёРµ Р·Р°РєСЂС‹С‚Рѕ
+		Request *r = new Request(*this);
+		//r->setConnection(this);
+		this->r_Outstanding.push_back( r );
+		first_time_connection = false;
+	}
+	if( r_Outstanding.empty() )
+		return;
+	assert( m2_Sock >0 );
+	if( !datawaiting(m2_Sock ) )
+	{
+		if(m_Outstanding.empty() )
+		return;
+		else goto response_processing;
+	}
+	unsigned char buf_r[ 2048 ];
+	int b = recv (m2_Sock, (char*)buf_r, sizeof(buf_r), 0);
+	if(b<0)
+	{
+		BailOnSocketError("recv()");
+		close();
+		httpparser::number_of_connections--;
+		ExitThread(retcode);
+	}
+	if( b == 0 ) //отсутствие данных в соккете
+	{
+		// соединение закрыто
 
-		Response* r = m_Outstanding.front();
+		Request* r = r_Outstanding.front();
 		r->notifyconnectionclosed();
 		assert( r->completed() );
 		delete r;
-		m_Outstanding.pop_front();
-
-		// Р»СЋР±С‹Рµ Р¶РґСѓС‰РёРµ Р·Р°РїСЂРѕСЃС‹ Р±СѓРґСѓС‚ РѕС‚Р±СЂРѕС€РµРЅС‹
+		this->r_Outstanding.pop_front();
+		// любые ждущие запросы будут отброшены
 		close();
 	}
 	else
 	{
-		int used = 0;
-		while( used < a && !m_Outstanding.empty() )
+		int used_r = 0;
+		while( used_r < b && !r_Outstanding.empty() )
 		{
 
-			Response* r = m_Outstanding.front();
-			int u = r->pump( &buf[used], a-used );
-
-			// СѓРґР°Р»РёС‚СЊ Р·Р°РІРµСЂС€РµРЅРЅС‹Р№ Р·Р°РїСЂРѕСЃ
+			Request* r = r_Outstanding.front();
+			int u_r = r->pump( &buf_r[used_r], b-used_r );
+			// удалить завершенный запрос
 			if( r->completed() )
 			{
 				delete r;
+				r_Outstanding.pop_front();
+				Request *new_r = new Request(*this);
+				r_Outstanding.push_back(new_r);
+			}
+			used_r += u_r;
+		}
+		if( used_r != b )
+		{
+				//assert( used_r == b );
+				httpparser::number_of_connections--;
+				ExitThread(retcode);
+		}
+	}
+response_processing:
+	if( m_Outstanding.empty() )
+		return;		// нет необработанных запросов
+
+	assert( m_Sock >0 );	// запросы есть, коннект сброшен!
+
+	if( !datawaiting( m_Sock ) )
+		return;				// recv будет заблочен
+
+	unsigned char buf_m[ 2048 ];
+	int a = recv( m_Sock, (char*)buf_m, sizeof(buf_m), 0 );
+	if( a<0 )
+	{
+		BailOnSocketError( "recv()" );
+		close();
+		httpparser::number_of_connections--;
+		ExitThread(retcode);
+
+	}
+	if( a== 0 ) //отсутствие данных в соккете
+	{
+		// соединение закрыто
+
+		Response* m = m_Outstanding.front();
+		m->notifyconnectionclosed();
+		assert( m->completed() );
+		delete m;
+		m_Outstanding.pop_front();
+
+		// любые ждущие запросы будут отброшены
+		//close();
+	}
+	else
+	{
+		int used_m = 0;
+		while( used_m < a && !m_Outstanding.empty() )
+		{
+
+			Response* m = m_Outstanding.front();
+			int u_m = m->pump( &buf_m[used_m], a-used_m );
+			/*if (m->bodydone() )
+			{
+				this->createresponse(m);
+			}*/
+			// удалить завершенный запрос
+			if( m->completed() )
+			{
+				delete m;
 				m_Outstanding.pop_front();
 			}
-			used += u;
+			used_m += u_m;
+		}		
+		// Если очередь ответов будет пустой, будут теряться байты
+		// (но сервер не должен отправлять что-либо, если еще есть что-то незавершенное)
+		if(used_m != a)
+		{
+			//assert( used_m == a );	// все байты должны быть использованы.
+			httpparser::number_of_connections--;
+			ExitThread(retcode);
+			//httpparser::number_of_connections--;
 		}
-
-		// Р•СЃР»Рё РѕС‡РµСЂРµРґСЊ РѕС‚РІРµС‚РѕРІ Р±СѓРґРµС‚ РїСѓСЃС‚РѕР№, Р±СѓРґСѓС‚ С‚РµСЂСЏС‚СЃСЏ Р±Р°Р№С‚С‹
-		// (РЅРѕ СЃРµСЂРІРµСЂ РЅРµ РґРѕР»Р¶РµРЅ РѕС‚РїСЂР°РІР»СЏС‚СЊ С‡С‚Рѕ-Р»РёР±Рѕ, РµСЃР»Рё РµС‰Рµ РµСЃС‚СЊ С‡С‚Рѕ-С‚Рѕ РЅРµР·Р°РІРµСЂС€РµРЅРЅРѕРµ
-		assert( used == a );	// РІСЃРµ Р±Р°Р№С‚С‹ РґРѕР»Р¶РЅС‹ Р±С‹С‚СЊ РёСЃРїРѕР»СЊР·РѕРІР°РЅС‹.
 	}
 }
 
@@ -454,7 +929,7 @@ void Connection::pump()
 
 
 
-// РєР»Р°СЃСЃ Response
+// класс Response
 //---------------------------------------------------------------------
 
 
@@ -466,62 +941,12 @@ Response::Response( const char* method, Connection& conn ) :
 	m_Status(0),
 	m_BytesRead(0),
 	m_Chunked(false),
+	cache_allowed(false),
 	m_ChunkLeft(0),
 	m_Length(-1),
 	m_WillClose(false)
 {
 }
-
-
-const char* Response::getheader( const char* name ) const
-{
-	std::string lname( name );
-	std::transform( lname.begin(), lname.end(), lname.begin(), tolower );
-
-	std::map< std::string, std::string >::const_iterator it = m_Headers.find( lname );
-	if( it == m_Headers.end() )
-		return 0;
-	else
-		return it->second.c_str();
-}
-
-
-int Response::getstatus() const
-{
-	// РІР°Р»РёРґРЅРѕ РїРѕСЃР»Рµ РїРѕР»СѓС‡РµРЅРёСЏ СЃС‚СЂРѕРєРё СЃРѕСЃС‚РѕСЏРЅРёСЏ
-	assert( m_State != STATUSLINE );
-	return m_Status;
-}
-
-
-const char* Response::getreason() const
-{
-	// РІР°Р»РёРґРЅРѕ РїРѕСЃР»Рµ РїРѕР»СѓС‡РµРЅРёСЏ СЃС‚СЂРѕРєРё СЃРѕСЃС‚РѕСЏРЅРёСЏ
-	assert( m_State != STATUSLINE );
-	return m_Reason.c_str();
-}
-
-
-
-// РЎРѕРµРґРёРЅРµРЅРёРµ Р±С‹Р»Рѕ Р·Р°РєСЂС‹С‚Рѕ
-void Response::notifyconnectionclosed()
-{
-	if( m_State == COMPLETE )
-		return;
-
-	// EOF РјРѕР¶РµС‚ Р±С‹С‚СЊ РІР°Р»РёРґРЅС‹Рј...
-	if( m_State == BODY &&
-		!m_Chunked &&
-		m_Length == -1 )
-	{
-		Finish();	// РіРѕС‚РѕРІРѕ!
-	}
-	else
-	{
-		throw Wobbly( "Connection closed unexpectedly" );
-	}
-}
-
 
 
 int Response::pump( const unsigned char* data, int datasize )
@@ -537,14 +962,14 @@ int Response::pump( const unsigned char* data, int datasize )
 			m_State == CHUNKLEN ||
 			m_State == CHUNKEND )
 		{
-			// "СЃРѕР±РёСЂР°РµРј" СЃС‚СЂРѕРєСѓ
+			// "собираем" строку
 			while( count > 0 )
 			{
 				char c = (char)*data++;
 				--count;
 				if( c == '\n' )
 				{
-					// РїРѕР»СѓС‡РёР»Рё РІСЃСЋ СЃС‚СЂРѕРєСѓ
+					// получили всю строку
 					switch( m_State )
 					{
 						case STATUSLINE:
@@ -560,7 +985,7 @@ int Response::pump( const unsigned char* data, int datasize )
 							ProcessChunkLenLine( m_LineBuf );
 							break;
 						case CHUNKEND:
-							// СЃРїРѕР№РјР°Р»Рё РїРµСЂРµРІРѕРґ СЃС‚СЂРѕРєРё РїРѕСЃР»Рµ С‚РµР»Р° РѕС‚РІРµС‚Р° Рё РїРµСЂРµС…РѕРґ Рє СЃР»РµРґ. СЃРѕСЃС‚РѕСЏРЅРёСЋ
+							// споймали перевод строки после тела ответа и переход к след. состоянию
 							assert( m_Chunked == true );
 							m_State = CHUNKLEN;
 							break;
@@ -568,11 +993,11 @@ int Response::pump( const unsigned char* data, int datasize )
 							break;
 					}
 					m_LineBuf.clear();
-					break;		// РІС‹Р№С‚Рё РёР· РіРµРЅРµСЂР°С†РёРё СЃС‚СЂРѕРєРё!
+					break;		// выйти из генерации строки!
 				}
 				else
 				{
-					if( c != '\r' )		// РёРіРЅРѕСЂРёСЂРѕРІР°С‚СЊ РІРѕР·РІСЂР°С‚ РєР°СЂРµС‚РєРё
+					if( c != '\r' )		// игнорировать возврат каретки
 						m_LineBuf += c;
 				}
 			}
@@ -589,20 +1014,74 @@ int Response::pump( const unsigned char* data, int datasize )
 		}
 	}
 
-	// С‡РёСЃР»Рѕ РёСЃРїРѕР»СЊР·РѕРІР°РЅРЅС‹С… Р±Р°Р№С‚
+	// число использованных байт
 	return datasize - count;
+}
+
+const char* Response::getheader( const char* name ) const
+{
+	std::string lname( name );
+	std::transform( lname.begin(), lname.end(), lname.begin(), tolower );
+
+	std::map< std::string, std::string >::const_iterator it = m_Headers.find( lname );
+	if( it == m_Headers.end() )
+		return 0;
+	else
+		return it->second.c_str();
+}
+
+
+int Response::getstatus() const
+{
+	// валидно после получения строки состояния
+	assert( m_State != STATUSLINE );
+	return m_Status;
+}
+
+
+const char* Response::getreason() const
+{
+	// валидно после получения строки состояния
+	assert( m_State != STATUSLINE );
+	return m_Reason.c_str();
 }
 
 
 
+// Соединение было закрыто
+void Response::notifyconnectionclosed()
+{
+	if( m_State == COMPLETE )
+		return;
+
+	// EOF может быть валидным...
+	if( m_State == BODY &&
+		!m_Chunked &&
+		m_Length == -1 )
+	{
+		Finish();	// готово!
+	}
+	else
+	{
+		WaitForSingleObject(general_mutex[0], INFINITE);
+			cout<<"Connection closed unexpectedly"<<endl;
+			this->getconnection()->close();
+		ReleaseMutex(general_mutex[0]);
+		httpparser::number_of_connections--;
+		ExitThread(retcode);
+
+		//throw Wobbly( "Connection closed unexpectedly" );
+	}
+}
+
 void Response::ProcessChunkLenLine( std::string const& line )
 {
-	// РґР»РёРЅР° РєСѓСЃРєР° РІ 16-СЂРёС‡РЅРѕР№ РІ РЅР°С‡Р°Р»Рµ СЃС‚СЂРѕРєРё
+	// длина куска в 16-ричной в начале строки
 	m_ChunkLeft = strtol( line.c_str(), NULL, 16 );
 	
 	if( m_ChunkLeft == 0 )
 	{
-		// РїРѕР»СѓС‡РёР»Рё РІСЃРµ С‚РµР»Рѕ, РїСЂРѕРІРµСЂРєР° Р·Р°РіРѕР»РѕРІРєРѕРІ-С‚СЂРµР№Р»РµСЂРѕРІ
+		// получили все тело, проверка заголовков-трейлеров
 		m_State = TRAILERS;
 		m_HeaderAccum.clear();
 	}
@@ -613,8 +1092,8 @@ void Response::ProcessChunkLenLine( std::string const& line )
 }
 
 
-// РѕР±СЂР°Р±РѕС‚РєР° РґР°РЅРЅС‹С… РїСЂРё РїРµСЂРµРґР°С‡Рµ С‡Р°СЃС‚СЏРјРё
-// РІРѕР·РІСЂР°С‰Р°РµС‚ С‡РёСЃР»Рѕ Р±Р°Р№С‚.
+// обработка данных при передаче частями
+// возвращает число байт.
 int Response::ProcessDataChunked( const unsigned char* data, int count )
 {
 	assert( m_Chunked );
@@ -623,7 +1102,7 @@ int Response::ProcessDataChunked( const unsigned char* data, int count )
 	if( n>m_ChunkLeft )
 		n = m_ChunkLeft;
 
-	// РІС‹Р·РІР°С‚СЊ РєРѕР»Р±СЌРє РґР»СЏ РїРµСЂРµРґР°С‡Рё РґР°РЅРЅС‹С…
+	// вызвать колбэк для передачи данных
 	if( m_Connection.m_ResponseDataCB )
 		(m_Connection.m_ResponseDataCB)( this, m_Connection.m_UserData, data, n );
 
@@ -633,32 +1112,32 @@ int Response::ProcessDataChunked( const unsigned char* data, int count )
 	assert( m_ChunkLeft >= 0);
 	if( m_ChunkLeft == 0 )
 	{
-		// РєСѓСЃРѕРє Р·Р°РІРµСЂС€РµРЅ, РїСЂРѕРїСѓСЃРєР°РµРј РїРµСЂРµРІРѕРґ СЃС‚СЂРѕРєРё РїРµСЂРµРґ С‚СЂРµР№Р»РµСЂР°РјРё РґР»СЏ СЃР»РµРґСѓСЋС‰РµРіРѕ РєСѓСЃРєР°
+		// кусок завершен, пропускаем перевод строки перед трейлерами для следующего куска
 		m_State = CHUNKEND;
 	}
 	return n;
 }
 
-// РѕР±СЂР°Р±РѕС‚РєР° РґР°РЅРЅС‹С… РїСЂРё РїРµСЂРµРґР°С‡Рµ С†РµР»РёРєРѕРј.
-// РІРѕР·РІСЂР°С‰Р°РµС‚ С‡РёСЃР»Рѕ Р±Р°Р№С‚.
+// обработка данных при передаче целиком.
+// возвращает число байт.
 int Response::ProcessDataNonChunked( const unsigned char* data, int count )
 {
 	int n = count;
 	if( m_Length != -1 )
 	{
-		// С‡РёСЃР»Рѕ Р±Р°Р№С‚ РёР·РІРµСЃС‚РЅРѕ
+		// число байт известно
 		int remaining = m_Length - m_BytesRead;
 		if( n > remaining )
 			n = remaining;
 	}
 
-	// РІС‹Р·РѕРІ РєРѕР»Р±СЌРєР° РґР»СЏ РїРµСЂРµРґР°С‡Рё РґР°РЅРЅС‹С…
+	// вызов колбэка для передачи данных
 	if( m_Connection.m_ResponseDataCB )
 		(m_Connection.m_ResponseDataCB)( this, m_Connection.m_UserData, data, n );
 
 	m_BytesRead += n;
 
-	// Р—Р°РєР°РЅС‡РёРІР°РµРј, РµСЃР»Рё РІСЃРµ РіРѕС‚РѕРІРѕ РёР»Рё Р¶РґРµРј СЂР°Р·СЂС‹РІР° СЃРѕРµРґРёРЅРµРЅРёСЏ
+	// Заканчиваем, если все готово или ждем разрыва соединения
 	if( m_Length != -1 && m_BytesRead == m_Length )
 		Finish();
 
@@ -670,7 +1149,7 @@ void Response::Finish()
 {
 	m_State = COMPLETE;
 
-	// РІС‹Р·РѕРІ РєРѕР»Р±СЌРєРѕРІ
+	// вызов колбэков
 	if( m_Connection.m_ResponseCompleteCB )
 		(m_Connection.m_ResponseCompleteCB)( this, m_Connection.m_UserData );
 }
@@ -680,24 +1159,24 @@ void Response::ProcessStatusLine( std::string const& line )
 {
 	const char* p = line.c_str();
 
-	// РїСЂРѕРїСѓСЃС‚РёС‚СЊ Р»СЋР±С‹Рµ РїСЂРµРґС€РµСЃС‚РІСѓСЋС‰РёРµ РїСЂРѕР±РµР»С‹
+	// пропустить любые предшествующие пробелы
 	while( *p && *p == ' ' )
 		++p;
 
-	// РІРµСЂСЃРёСЏ РїСЂРѕС‚РѕРєРѕР»Р°
+	// версия протокола
 	while( *p && *p != ' ' )
 		m_VersionString += *p++;
 	while( *p && *p == ' ' )
 		++p;
 
-	// СЃС‚Р°С‚СѓСЃ-РєРѕРґ
+	// статус-код
 	std::string status;
 	while( *p && *p != ' ' )
 		status += *p++;
 	while( *p && *p == ' ' )
 		++p;
 
-	// РѕСЃС‚Р°Р»СЊРЅРѕРµ - СЃС‚СЂРѕРєР° РїСЂРёС‡РёРЅС‹
+	// остальное - строка причины
 	while( *p )
 		m_Reason += *p++;
 
@@ -717,37 +1196,37 @@ void Response::ProcessStatusLine( std::string const& line )
 		m_Version = 11;
 	else
 		throw Wobbly( "UnknownProtocol (%s)", m_VersionString.c_str() );
-	// HTTP/0.9 РЅРµ РїРѕРґРґРµСЂР¶РёРІР°РµС‚
+	// HTTP/0.9 не поддерживает
 
 	
-	// С‚РµРїРµСЂСЊ РёРґСѓС‚ Р·Р°РіРѕР»РѕРІРєРё
+	// теперь идут заголовки
 	m_State = HEADERS;
 	m_HeaderAccum.clear();
 }
 
 
-// РѕР±СЂР°Р±РѕС‚РєР° РґР°РЅРЅС‹С… Р·Р°РіРѕР»РѕРІРєР°
+// обработка данных заголовка
 void Response::FlushHeader()
 {
 	if( m_HeaderAccum.empty() )
-		return;	// РЅРµ РЅСѓР¶РЅР°
+		return;	// не нужна
 
 	const char* p = m_HeaderAccum.c_str();
 
 	std::string header;
 	std::string value;
 	while( *p && *p != ':' )
-		header += tolower( *p++ );
+		header += *p++ ;
 
-	// РїСЂРѕРїСѓСЃРє ':'
+	// пропуск ':'
 	if( *p )
 		++p;
 
-	// РїСЂРѕРїСѓСЃРє РїСЂРѕР±РµР»РѕРІ
+	// пропуск пробелов
 	while( *p && (*p ==' ' || *p=='\t') )
 		++p;
 
-	value = p; // РѕСЃС‚Р°Р»СЊРЅР°СЏ С‡Р°СЃС‚СЊ СЃС‚СЂРѕРєРё - Р·РЅР°С‡РµРЅРёРµ
+	value = p; // остальная часть строки - значение
 
 	m_Headers[ header ] = value;
 //	printf("header: ['%s': '%s']\n", header.c_str(), value.c_str() );	
@@ -762,19 +1241,19 @@ void Response::ProcessHeaderLine( std::string const& line )
 	if( line.empty() )
 	{
 		FlushHeader();
-		// РєРѕРЅРµС† Р·Р°РіРѕР»РѕРІРєРѕРІ
+		// конец заголовков
 
-		// РєРѕРґ 100 РёРіРЅРѕСЂРёСЂСѓРµС‚СЃСЏ
+		// код 100 игнорируется
 		if( m_Status == CONTINUE )
-			m_State = STATUSLINE;	// СЃР±СЂРѕСЃ РїР°СЂСЃРёРЅРіР° Рё РѕР¶РёРґР°РЅРёРµ РЅРѕРІРѕР№ СЃС‚СЂРѕРєРё СЃРѕСЃС‚РѕСЏРЅРёСЏ
+			m_State = STATUSLINE;	// сброс парсинга и ожидание новой строки состояния
 		else
-			BeginBody();			// РѕР±СЂР°Р±РѕС‚РєР° С‚РµР»Р° РѕС‚РІРµС‚Р°
+			BeginBody();			// обработка тела ответа
 		return;
 	}
 
 	if( isspace(*p) )
 	{
-		// СЃС‚СЂРѕРєР° РїСЂРѕРґРѕР»Р¶РµРЅРёСЏ - РґРѕР±Р°РІРёС‚СЊ Рє РїСЂРµРґС€РµСЃС‚РІСѓСЋС‰РёРј РґР°РЅРЅС‹Рј
+		// строка продолжения - добавить к предшествующим данным
 		++p;
 		while( *p && isspace( *p ) )
 			++p;
@@ -784,7 +1263,7 @@ void Response::ProcessHeaderLine( std::string const& line )
 	}
 	else
 	{
-		// РІР·СЏС‚СЊ РЅРѕРІС‹Р№ Р·Р°РіРѕР»РѕРІРѕРє
+		// взять новый заголовок
 		FlushHeader();
 		m_HeaderAccum = p;
 	}
@@ -793,58 +1272,58 @@ void Response::ProcessHeaderLine( std::string const& line )
 
 void Response::ProcessTrailerLine( std::string const& line )
 {
-	// РЎРґРµР»Р°С‚СЊ: РѕР±СЂР°Р±РѕС‚РєР° РґРѕРї. Р·Р°РіРѕР»РѕРІРєРѕРІ	
+	// Сделать: обработка доп. заголовков	
 	if( line.empty() )
 		Finish();
 
-	// РїСЂРѕСЃС‚Рѕ РёРіРЅРѕСЂРёСЂСѓРµРј РґРѕРї. Р·Р°РіРѕР»РѕРІРєРё
+	// просто игнорируем доп. заголовки
 }
 
 
 
-// РЎРїРµСЂРІР° РїСЂРѕРІРµСЂРєР° РёРЅС„РѕСЂРјР°С†РёРё, РїРѕР»СѓС‡РµРЅРЅРѕР№ РёР· Р·Р°РіРѕР»РѕРІРєРѕРІ, Р·Р°С‚РµРј - РїРµСЂРµС…РѕРґ Рє СЂР°Р·Р±РѕСЂСѓ С‚РµР»Р° РѕС‚РІРµС‚Р°
+// Сперва проверка информации, полученной из заголовков, затем - переход к разбору тела ответа
 void Response::BeginBody()
 {
 
 	m_Chunked = false;
-	m_Length = -1;	// РЅРµРёР·РІРµСЃС‚РЅР°
+	m_Length = -1;	// неизвестна
 	m_WillClose = false;
 
-	// РёСЃРїРѕР»СЊР·СѓРµС‚СЃСЏ РєРѕРґРёСЂРѕРІРєР°?
+	// используется кодировка?
 	const char* trenc = getheader( "transfer-encoding" );
-	if( trenc && 0==strcasecmp( trenc, "chunked") )
+	if( trenc && 0==strcmpi( trenc, "chunked") )
 	{
 		m_Chunked = true;
-		m_ChunkLeft = -1;	// РЅРµРёР·РІРµСЃС‚РЅРѕ
+		m_ChunkLeft = -1;	// неизвестно
 	}
 
 	m_WillClose = CheckClose();
 
-	// Р·Р°РґР°РЅР° РґР»РёРЅР°?
+	// задана длина?
 	const char* contentlen = getheader( "content-length" );
 	if( contentlen && !m_Chunked )
 	{
 		m_Length = atoi( contentlen );
 	}
 
-	// РїСЂРѕРІРµСЂРєР° СЃРѕСЃС‚РѕСЏРЅРёР№, РїСЂРё РєРѕС‚РѕСЂС‹С… РѕР¶РёРґР°РµС‚СЃСЏ РЅСѓР»РµРІРѕР№ РѕР±СЉРµРј РґР°РЅРЅС‹С…
+	// проверка состояний, при которых ожидается нулевой объем данных
 	if( m_Status == NO_CONTENT ||
 		m_Status == NOT_MODIFIED ||
-		( m_Status >= 100 && m_Status < 200 ) ||		// 1xx РєРѕРґС‹ Р±РµР· С‚РµР»Р° РѕС‚РІРµС‚Р°
+		( m_Status >= 100 && m_Status < 200 ) ||		// 1xx коды без тела ответа
 		m_Method == "HEAD" )
 	{
 		m_Length = 0;
 	}
 
 
-	// РµСЃР»Рё РЅРµ РёСЃРїРѕР»СЊР·СѓРµС‚СЃСЏ С‡Р°СЃС‚РёС‡РЅР°СЏ РїРµСЂРµРґР°С‡Р° Рё РґР»РёРЅР° РЅРµ Р±С‹Р»Р° РѕРїСЂРµРґРµР»РµРЅР°,
-	// СѓР±РµРґРёС‚СЃСЏ, С‡С‚Рѕ СЃРѕРµРґРёРЅРµРЅРёРµ Р±СѓРґРµС‚ СЂР°Р·РѕСЂРІР°РЅРѕ.
+	// если не используется частичная передача и длина не была определена,
+	// убедится, что соединение будет разорвано.
 	if( !m_WillClose && !m_Chunked && m_Length == -1 )
 		m_WillClose = true;
 
 
 
-	// РІС‹Р·РІРѕРІ РїРѕР»СЊР·РѕРІР°С‚РµР»СЊСЃРєРёС… РєРѕР»Р±СЌРєРѕРІ, РµСЃР»Рё РµСЃС‚СЊ
+	// вызвов пользовательских колбэков, если есть
 	if( m_Connection.m_ResponseBeginCB )
 		(m_Connection.m_ResponseBeginCB)( this, m_Connection.m_UserData );
 
@@ -856,7 +1335,7 @@ void Response::BeginBody()
 	printf("ChunkLeft: %d\n", (int)m_ChunkLeft );
 	printf("----------------------------\n");
 */
-	// С‡С‚РµРЅРёРµ РґР°РЅРЅС‹С… С‚РµР»Р°
+	// чтение данных тела
 	if( m_Chunked )
 		m_State = CHUNKLEN;
 	else
@@ -864,27 +1343,424 @@ void Response::BeginBody()
 }
 
 
-// true, РµСЃР»Рё СЃРµСЂРІРµСЂ СЃР°Рј СЂР°Р·РѕСЂРІРµС‚ СЃРѕРµРґРёРЅРµРЅРёРµ
+// true, если сервер сам разорвет соединение
 bool Response::CheckClose()
 {
 	if( m_Version == 11 )
 	{
 		// HTTP1.1
-		// СЃРѕРµРґРёРЅРµРЅРёРµ РѕС‚РєСЂС‹С‚Рѕ, РґР°Р¶Рµ РµСЃР»Рё "connection: close" РѕРїСЂРµРґРµР»РµРЅРѕ.
+		// соединение открыто, даже если "connection: close" определено.
 		const char* conn = getheader( "connection" );
-		if( conn && 0==strcasecmp( conn, "close" ) )
+		if( conn && 0==strcmpi( conn, "close" ) )
 			return true;
 		else
 			return false;
 	}
 
-	// Р±РѕР»РµРµ СЃС‚Р°СЂС‹Рµ РІРµСЂСЃРёРё HTTP
-	// keep-alive Р·Р°РіРѕР»РѕРІРѕРє СѓРєР°Р·С‹РІР°РµС‚ РЅР° РїРѕСЃС‚РѕСЏРЅРЅРѕРµ СЃРѕРµРґРёРЅРµРЅРёРµ 
+	// более старые версии HTTP
+	// keep-alive заголовок указывает на постоянное соединение 
 	if( getheader( "keep-alive" ) )
 		return false;	
 	return true;
 }
 
+Request::Request( Connection& conn ) :
+	r_Connection( conn ),
+	r_State( METHODURL ),
+	r_BytesRead(0),
+	r_Chunked(false),
+	r_ChunkLeft(0),
+	r_Length(-1),
+	r_WillClose(false),
+	//r_Method("NONE"),
+	//r_URL("NONE"),
+	r_Version(0)
+	//r_VersionString("NONE")
+{
+}
+
+int Request::pump( const unsigned char* data, int datasize )
+{
+	assert( datasize != 0 );
+	int count = datasize;
+
+	while( count > 0 && r_State != COMPLETE )
+	{
+		if( r_State == METHODURL ||
+			r_State == HEADERS ||
+			r_State == TRAILERS ||
+			r_State == CHUNKLEN ||
+			r_State == CHUNKEND )
+		{
+			// "собираем" строку
+			while( count > 0 )
+			{
+				char c = (char)*data++;
+				--count;
+				if( c == '\n' )
+				{
+					// получили всю строку
+					switch( r_State )
+					{
+					case METHODURL:
+						ProcessMethodUrlLine( r_LineBuf );
+						break;
+					case HEADERS:
+						ProcessHeaderLine( r_LineBuf );
+						break;
+					case TRAILERS:
+						ProcessTrailerLine( r_LineBuf );
+						break;
+					case CHUNKLEN:
+						ProcessChunkLenLine( r_LineBuf );
+						break;
+					case CHUNKEND:
+						// споймали перевод строки после тела ответа и переход к след. состоянию
+						assert( r_Chunked == true );
+						r_State = CHUNKLEN;
+						break;
+					default:
+						break;
+					}
+					r_LineBuf.clear();
+					break;		// выйти из генерации строки!
+				}
+				else
+				{
+					if( c != '\r' )		// игнорировать возврат каретки
+						r_LineBuf += c;
+				}
+			}
+		}
+		else if( r_State == BODY )
+		{
+			int bytesused = 0;
+			if( r_Chunked )
+				bytesused = ProcessDataChunked( data, count );
+			else
+				bytesused = ProcessDataNonChunked( data, count );
+			data += bytesused;
+			count -= bytesused;
+		}
+	}
+
+	// число использованных байт
+	return datasize - count;
+}
+
+const char* Request::getheader( const char* name ) const
+{
+	std::string lname( name );
+	std::transform( lname.begin(), lname.end(), lname.begin(), tolower );
+	std::vector< std::string >::const_iterator it = std::find(r_Headers.begin(), r_Headers.end(), lname );
+	if( it == r_Headers.end() )
+		return 0;
+	else
+		return it->data();
+}
 
 
-}	// РєРѕРЅРµС† РїСЂРѕСЃС‚СЂР°РЅСЃС‚РІР° РёРјРµРЅ
+/*int Request::getstatus() const
+{
+	// валидно после получения строки состояния
+	assert( r_State != METHODURL );
+	return r_Status;
+}
+*/
+
+/*const char* Request::getreason() const
+{
+	// валидно после получения строки состояния
+	assert( m_State != STATUSLINE );
+	return m_Reason.c_str();
+}*/
+
+
+// Соединение было закрыто
+void Request::notifyconnectionclosed()
+{
+	if( r_State == COMPLETE )
+		return;
+
+	// EOF может быть валидным...
+	if( r_State == BODY &&
+		!r_Chunked &&
+		r_Length == -1 )
+	{
+		Finish();	// готово!
+	}
+	else
+	{
+		throw Wobbly( "Connection closed unexpectedly" );
+	}
+}
+
+void Request::ProcessChunkLenLine( std::string const& line )
+{
+	// длина куска в 16-ричной в начале строки
+	r_ChunkLeft = strtol( line.c_str(), NULL, 16 );
+	
+	if( r_ChunkLeft == 0 )
+	{
+		// получили все тело, проверка заголовков-трейлеров
+		r_State = TRAILERS;
+		r_HeaderAccum.clear();
+	}
+	else
+	{
+		r_State = BODY;
+	}
+}
+
+
+// обработка данных при передаче частями
+// возвращает число байт.
+int Request::ProcessDataChunked( const unsigned char* data, int count )
+{
+	assert( r_Chunked );
+
+	int n = count;
+	if( n>r_ChunkLeft )
+		n = r_ChunkLeft;
+
+	// вызвать колбэк для передачи данных
+	if( r_Connection.r_RequestDataCB )
+		(r_Connection.r_RequestDataCB)( this, r_Connection.r_UserData, data, n );
+
+	r_BytesRead += n;
+
+	r_ChunkLeft -= n;
+	assert( r_ChunkLeft >= 0);
+	if( r_ChunkLeft == 0 )
+	{
+		// кусок завершен, пропускаем перевод строки перед трейлерами для следующего куска
+		r_State = CHUNKEND;
+	}
+	return n;
+}
+
+// обработка данных при передаче целиком.
+// возвращает число байт.
+int Request::ProcessDataNonChunked( const unsigned char* data, int count )
+{
+	int n = count;
+	if( r_Length != -1 )
+	{
+		// число байт известно
+		int remaining = r_Length - r_BytesRead;
+		if( n > remaining )
+			n = remaining;
+	}
+
+	// вызов колбэка для передачи данных
+	if( r_Connection.r_RequestDataCB )
+		(r_Connection.r_RequestDataCB)( this, r_Connection.r_UserData, data, n );
+
+	r_BytesRead += n;
+
+	// Заканчиваем, если все готово или ждем разрыва соединения
+	if( r_Length != -1 && r_BytesRead == r_Length )
+		Finish();
+
+	return n;
+}
+
+
+void Request::Finish()
+{
+	r_State = COMPLETE;
+
+	// вызов колбэков
+	if( r_Connection.r_RequestCompleteCB )
+		(r_Connection.r_RequestCompleteCB)( this, r_Connection.r_UserData );
+}
+
+void Request::ProcessMethodUrlLine( std::string const& line )
+{
+	const char* p = line.c_str();
+
+	// пропустить любые предшествующие пробелы
+	while( *p && *p == ' ' )
+		++p;
+
+	// метод
+	while( *p && *p != ' ' )
+		r_Method += *p++;
+	while( *p && *p == ' ' )
+		++p;
+
+	// URL
+	while( *p && *p != ' ' )
+		r_URL += *p++;
+	while( *p && *p == ' ' )
+		++p;
+
+	// остальное - версия
+	while( *p )
+		r_VersionString += *p++;
+
+/*
+	printf( "version: '%s'\n", m_VersionString.c_str() );
+	printf( "status: '%d'\n", m_Status );
+	printf( "reason: '%s'\n", m_Reason.c_str() );
+*/
+
+	if( r_VersionString == "HTTP:/1.0" )
+		r_Version = 10;
+	else if( 0==r_VersionString.compare( 0,7,"HTTP/1." ) )
+		r_Version = 11;
+	else
+		throw Wobbly( "UnknownProtocol (%s)", r_VersionString.c_str() );
+	// HTTP/0.9 не поддерживает
+
+	
+	// теперь идут заголовки
+	r_State = HEADERS;
+	r_HeaderAccum.clear();
+}
+
+// обработка данных заголовка
+void Request::FlushHeader()
+{
+	if( r_HeaderAccum.empty() )
+		return;	// не нужна
+
+	const char* p = r_HeaderAccum.c_str();
+
+	std::string header;
+	std::string value;
+	while( *p && *p != ':' )
+		header +=  *p++;
+
+	// пропуск ':'
+	if( *p )
+		++p;
+
+	// пропуск пробелов
+	while( *p && (*p ==' ' || *p=='\t') )
+		++p;
+
+	value = p; // остальная часть строки - значение
+
+	r_Headers.push_back(header);
+	r_Headers.push_back(value);
+//	printf("header: ['%s': '%s']\n", header.c_str(), value.c_str() );	
+
+	r_HeaderAccum.clear();
+}
+
+
+void Request::ProcessHeaderLine( std::string const& line )
+{
+	const char* p = line.c_str();
+	if( line.empty() )
+	{
+		FlushHeader();
+		BeginBody();			// обработка тела ответа
+		return;
+	}
+
+	if( isspace(*p) )
+	{
+		// строка продолжения - добавить к предшествующим данным
+		++p;
+		while( *p && isspace( *p ) )
+			++p;
+		r_HeaderAccum += ' ';
+		r_HeaderAccum += p;
+	}
+	else
+	{
+		// взять новый заголовок
+		FlushHeader();
+		r_HeaderAccum = p;
+	}
+}
+
+
+void Request::ProcessTrailerLine( std::string const& line )
+{
+	// Сделать: обработка доп. заголовков	
+	if( line.empty() )
+		Finish();	
+	// просто игнорируем доп. заголовки
+}
+
+
+
+// Сперва проверка информации, полученной из заголовков, затем - переход к разбору тела ответа
+void Request::BeginBody()
+{
+
+	r_Chunked = false;
+	r_Length = -1;	// неизвестна
+	r_WillClose = false;
+
+	// используется кодировка?
+	const char* trenc = getheader( "transfer-encoding" );
+	if( trenc && 0==strcmpi( trenc, "chunked") )
+	{
+		r_Chunked = true;
+		r_ChunkLeft = -1;	// неизвестно
+	}
+
+	r_WillClose = CheckClose();
+
+	// задана длина?
+	const char* contentlen = getheader( "content-length" );
+	if( contentlen && !r_Chunked )
+	{
+		this->r_Length = atoi( contentlen );
+	}
+	if(this->r_Method != "POST" && this->r_Method != "PATCH" && this->r_Method != "PUT")
+		this->r_Length = -1;
+
+	// если не используется частичная передача и длина не была определена,
+	// убедится, что соединение будет разорвано.
+	if( !r_WillClose && !r_Chunked && r_Length == -1 )
+		r_WillClose = true;
+
+
+
+	// вызвов пользовательских колбэков, если есть
+	if( r_Connection.r_RequestBeginCB )
+		(r_Connection.r_RequestBeginCB)( this, r_Connection.r_UserData );
+
+/*
+	printf("---------BeginBody()--------\n");
+	printf("Length: %d\n", m_Length );
+	printf("WillClose: %d\n", (int)m_WillClose );
+	printf("Chunked: %d\n", (int)m_Chunked );
+	printf("ChunkLeft: %d\n", (int)m_ChunkLeft );
+	printf("----------------------------\n");
+*/
+	// чтение данных тела
+	if( r_Chunked )
+		r_State = CHUNKLEN;
+	else
+		r_State = BODY;
+}
+
+
+// true, если сервер сам разорвет соединение
+bool Request::CheckClose()
+{
+	if( r_Version == 11 )
+	{
+		// HTTP1.1
+		// соединение открыто, даже если "connection: close" определено.
+		const char* conn = getheader( "connection" );
+		if( conn && 0==strcmpi( conn, "close" ) )
+			return true;
+		else
+			return false;
+	}
+
+	// более старые версии HTTP
+	// keep-alive заголовок указывает на постоянное соединение 
+	if( getheader( "keep-alive" ) )
+		return false;	
+	return true;
+}
+
+}	// конец пространства имен

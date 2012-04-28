@@ -1,11 +1,23 @@
-#ifndef httpparser_H
-#define httpparser_H
+#ifndef ParserHeader_H
+#define ParserHeader_H
 
 #include <string>
 #include <map>
 #include <vector>
 #include <deque>
-//РґРёР°РіСЂР°РјРјРєР° РёР· httplib.py
+#ifdef WIN32
+#include <winsock2.h>
+#define vsnprintf _vsnprintf
+#endif
+#define _AFXDLL
+/*#ifdef WIN32
+	#include <winsock2.h>
+	#define vsnprintf _vsnprintf
+#endif*/
+//#include <afxwin.h>
+#include <Windows.h>
+
+//диаграммка из httplib.py
 /*(null)
 |
 | HTTPConnection()
@@ -39,29 +51,34 @@ response.read()|        | ( putheader() )*  endheaders()
 						Request-sent
 */
 
-//СЃРґРµР»Р°Р№ СЂРµР°Р»РёР·Р°С†РёСЋ РґР»СЏ СЃС‚РѕСЂРѕРЅС‹ РєР»РёРµРЅС‚-РїСЂРѕРєСЃРё!!!!
+//сделай реализацию для стороны клиент-прокси!!!!
 struct in_addr;
 
 namespace httpparser
 {
 class Response;
-
+class Request;
+//void whatismyIP();
 void BailOnSocketError( const char* context );
+void want_to_print(const char* str);
+DWORD WINAPI NewConnection(LPVOID connection);
 struct in_addr *atoaddr( const char* address);
 
 typedef void (*ResponseBegin_CB)( const Response* r, void* userdata );
 typedef void (*ResponseData_CB)( const Response* r, void* userdata, const unsigned char* data, int numbytes );
 typedef void (*ResponseComplete_CB)( const Response* r, void* userdata );
+typedef void (*RequestBegin_CB)( const Request* r, void* userdata );
+typedef void (*RequestData_CB)( const Request* r, void* userdata, const unsigned char* data, int numbytes );
+typedef void (*RequestComplete_CB)( const Request* r, void* userdata );
 
-
-// РєРѕРґС‹ СЃС‚Р°С‚СЃСѓР° HTTP
+// коды статсуа HTTP
 enum {
-	// 1xx РёРЅС„РѕСЂРјР°С†РёРѕРЅРЅС‹Рµ
+	// 1xx информационные
 	CONTINUE = 100,
 	SWITCHING_PROTOCOLS = 101,
 	PROCESSING = 102,
 
-	// 2xx СѓСЃРїРµС€РЅРѕРµ Р·Р°РІРµСЂС€РµРЅРёРµ
+	// 2xx успешное завершение
 	OK = 200,
 	CREATED = 201,
 	ACCEPTED = 202,
@@ -72,7 +89,7 @@ enum {
 	MULTI_STATUS = 207,
 	IM_USED = 226,
 
-	// 3xx РїРµСЂРµРЅР°РїСЂР°РІР»РµРЅРёРµ
+	// 3xx перенаправление
 	MULTIPLE_CHOICES = 300,
 	MOVED_PERMANENTLY = 301,
 	FOUND = 302,
@@ -81,7 +98,7 @@ enum {
 	USE_PROXY = 305,
 	TEMPORARY_REDIRECT = 307,
 	
-	// 4xx РѕС€РёР±РєРё РєР»РёРµРЅС‚Р°
+	// 4xx ошибки клиента
 	BAD_REQUEST = 400,
 	UNAUTHORIZED = 401,
 	PAYMENT_REQUIRED = 402,
@@ -105,7 +122,7 @@ enum {
 	FAILED_DEPENDENCY = 424,
 	UPGRADE_REQUIRED = 426,
 
-	// 5xx РѕС€РёР±РєРё СЃРµСЂРІРµСЂР°
+	// 5xx ошибки сервера
 	INTERNAL_SERVER_ERROR = 500,
 	NOT_IMPLEMENTED = 501,
 	BAD_GATEWAY = 502,
@@ -118,7 +135,7 @@ enum {
 
 
 
-// РљР»Р°СЃСЃ РёСЃРєР»СЋС‡РµРЅРёР№
+// Класс исключений
 
 class Wobbly
 {
@@ -133,170 +150,345 @@ protected:
 
 
 
-// РєР»Р°СЃСЃ СЃРѕРµРґРёРЅРµРЅРёСЏ
-// Р”РµСЂР¶РёС‚ СЃРѕРµРґРёРЅРµРЅРёРµ СЃРѕРєРєРµС‚Р°, РѕС‚РїСЂР°РІР»СЏРµС‚ Р·Р°РїСЂРѕСЃС‹ Рё РѕР±СЂР°Р±Р°С‚С‹РІР°РµС‚ РѕС‚РІРµС‚С‹
+// класс соединения
+// Держит соединение соккета, отправляет запросы и обрабатывает ответы
 // ------------------------------------------------
-
+class Connection;
+class ProxyServer
+{
+	friend class Connection;
+public:
+	ProxyServer(int port);
+	~ProxyServer();
+	void whatismyIP();
+	void bind_this_port();
+	void close();
+	void keepconnections();
+	HANDLE HANDLES[100];
+private:
+	int port;
+	SOCKET mysocket;
+	sockaddr_in local_addr;
+	int number_of_connections;	
+};
 class Connection
 {
 	friend class Response;
+	friend class Request;
 public:
-	// СЃСЂР°Р·Сѓ РЅРµ РєРѕРЅРЅРµРєС‚РёС‚
-	Connection( const char* host, int port );
+	// сразу не коннектит
+	Connection( const char* host, int port, const char* version );
 	~Connection();
 
-	// РѕР±СЃР»СѓР¶РёРІР°СЋС‰РёРµ РѕС‚РІРµС‚С‹ РєРѕР»Р±СЌРєРё. Р‘СѓРґСѓС‚ РІС‹Р·РІР°РЅС‹ РїСЂРё РѕР±СЂР°С‰РµРЅРёРё Рє pump()	
-	// begincb		- РІС‹Р·С‹РІР°РµС‚СЃСЏ, РєРѕРіРґР° РїСЂРёС€РµР» Р·Р°РіРѕР»РѕРІРѕРє РѕС‚РІРµС‚Р°
-	// datacb		- РІС‹Р·С‹РІР°РµС‚СЃСЏ РґР»СЏ СЂР°Р·Р±РѕСЂР° РґР°РЅРЅС‹С… РѕС‚РІРµС‚Р°
-	// completecb	- РІС‹Р·С‹РІР°РµС‚СЃСЏ, РєРѕРіРґР° РѕС‚РІРµС‚ РїСЂРёС€РµР» РїРѕР»РЅРѕСЃС‚СЊСЋ
-	// userdata РїРµСЂРµРґР°РµС‚СЃСЏ РєР°Рє РїР°СЂР°РјРµС‚СЂ РґР»СЏ РІСЃРµС… РєРѕР»Р±СЌРєРѕРІ.
+	// обслуживающие ответы колбэки. Будут вызваны при обращении к pump()	
+	// begincb		- вызывается, когда пришел заголовок ответа
+	// datacb		- вызывается для разбора данных ответа
+	// completecb	- вызывается, когда ответ пришел полностью
+	// userdata передается как параметр для всех колбэков.
 	void setcallbacks(
-		ResponseBegin_CB begincb,
-		ResponseData_CB datacb,
-		ResponseComplete_CB completecb,
-		void* userdata );
+		ResponseBegin_CB begincbm,
+		ResponseData_CB datacbm,
+		ResponseComplete_CB completecbm,
+		void* userdatam,
+		RequestBegin_CB	begincbr,
+		RequestData_CB datacbr,
+		RequestComplete_CB completecbr,
+		void* userdatar);
 
-	// Р—Р°РїСЂРѕСЃС‹ Р±СѓРґСѓС‚ Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРё СЃРѕР·РґР°РІР°С‚СЊ СЃРѕРµРґРёРЅРµРЅРёРµ
-	// РР·-Р·Р° Р±Р»РѕРєРёСЂРѕРІРєРё РёРЅРѕРіРґР° РїСЂРёРґРµС‚СЃСЏ РІС‹Р·С‹РІР°С‚СЊ СЏРІРЅРѕ Р·Р°СЂР°РЅРµРµ
+	// Запросы будут автоматически создавать соединение
+	// Из-за блокировки иногда придется вызывать явно заранее
 	void connect();
 
-	// СЂР°Р·СЂС‹РІ СЃРѕРµРґРёРЅРµРЅРёСЏ, СѓР±РёСЂР°СЏ РІСЃРµ РѕР¶РёРґР°СЋС‰РёРµ Р·Р°РїСЂРѕСЃС‹.
+	// разрыв соединения, убирая все ожидающие запросы.
 	void close();
 
-	// РћР±РЅРѕРІР»РµРЅРёРµ СЃРѕРµРґРёРЅРµРЅРёСЏ
-	// Р”Р»СЏ РѕР±СЂР°Р±РѕС‚РєРё РЅРµРІС‹РїРѕР»РЅРµРЅРЅС‹С… Р·Р°РїСЂРѕСЃРѕРІ РІС‹Р·С‹РІР°Р№ РїРµСЂРёРѕРґРёС‡РµСЃРєРё.
+	// Обновление соединения
+	// Для обработки невыполненных запросов вызывай периодически.
 	void pump();
-
-	// РѕСЃС‚Р°Р»РёСЃСЊ Р»Рё РµС‰Рµ Р·Р°РїСЂРѕСЃС‹?
-	bool outstanding() const
+	void createresponse(const Response* r);
+	void createrequest(const Request* r);
+	// остались ли еще запросы?
+	bool moutstanding() const
 		{ return !m_Outstanding.empty(); }
-
-	// РІС‹СЃРѕРєРѕСѓСЂРѕРІРЅРµРІС‹Р№ РёРЅС‚РµСЂС„РµР№СЃ Р·Р°РїСЂРѕСЃРѕРІ
+	bool routstaning() const
+	{
+		return !r_Outstanding.empty();
+	}
+	std::deque< Request* > getrout()
+	{
+		return r_Outstanding;
+	}
+	std::deque< Response* > getmout()
+	{
+		return m_Outstanding;
+	}
+	void setsock_1(int sock)
+	{
+		m_Sock = sock;
+	}
+	void setsock_2(int sock)
+	{
+		m2_Sock = sock;
+	}
+	int getsock_1()
+	{
+		return m_Sock;
+	}
+	int getsock_2()
+	{
+		return m2_Sock;
+	}
+	std::string get_resp_done() const
+	{
+		return resp_done;
+	}
+	std::string get_req_done() const
+	{
+		return req_done;
+	}
+	bool first() const
+	{
+		return first_time_connection;
+	}
+	void setport_1(int port)
+	{
+		m_Port = port;
+	}
+	void setport_2(int port)
+	{
+		m2_Port = port;
+	}
+	// высокоуровневый интерфейс запросов
 	// ---------------------------
 	
-	// РјРµС‚РѕРґС‹: GET, POST Рё С‚.Рґ.
-	// url - С‚РѕР»СЊРєРѕ С‡Р°СЃС‚СЊ РїСѓС‚Рё: Рє РїСЂРёРјРµСЂСѓ,  "/index.html"
-	// Р·Р°РіРѕР»РѕРІРєРё - РЅР°Р±РѕСЂС‹ РїР°СЂ РёРјСЏ/Р·РЅР°С‡РµРЅРёРµ, Р·Р°РєР°РЅС‡РёРІР°СЋС‰РёС…СЃСЏ СЃРёРјРІРѕР»РѕРј РЅСѓР»СЏ СЃС‚СЂРѕРєРё
-	// body Рё bodysize РѕРїСЂРµРґРµР»СЏСЋС‚ РґР°РЅРЅС‹Рµ Р·Р°РїСЂРѕСЃР° (РЅР°РїСЂРёРјРµСЂ, Р·РЅР°С‡РµРЅРёСЏ РґР»СЏ С„РѕСЂРјС‹)
+	// методы: GET, POST и т.д.
+	// url - только часть пути: к примеру,  "/index.html"
+	// заголовки - наборы пар имя/значение, заканчивающихся символом нуля строки
+	// body и bodysize определяют данные запроса (например, значения для формы)
 	void request( const char* method, const char* url, const char* headers[]=0,
 		const unsigned char* body=0, int bodysize=0 );
-
-	// РЅРёР·РєРѕСѓСЂРѕРІРЅРµРІС‹Р№ РёРЅС‚РµСЂС„РµР№СЃ Р·Р°РїСЂРѕСЃРѕРІ
+	void response( const char* version, const char* reason, const char* status,	const char* headers[]=0,
+		const unsigned char* body=0, int bodysize=0 );
+	// низкоуровневый интерфейс запросов
 	// ---------------------------
 
-	// РЅР°С‡Р°С‚СЊ Р·Р°РїСЂРѕСЃ
-	// РјРµС‚РѕРґС‹: GET, POST Рё С‚.Рґ.
-	// url - С‚РѕР»СЊРєРѕ С‡Р°СЃС‚СЊ РїСѓС‚Рё: Рє РїСЂРёРјРµСЂСѓ,  "/index.html"
+	// начать запрос
+	// методы: GET, POST и т.д.
+	// url - только часть пути: к примеру,  "/index.html"
 	void putrequest( const char* method, const char* url );
-
-	// РґРѕР±Р°РІР»РµРЅРёРµ Р·Р°РіРѕР»РѕРІРєР° Р·Р°РїСЂРѕСЃСѓ
+	void putresponse( const char* version, const char* reason, const char* status);
+	// добавление заголовка запросу
 	void putheader( const char* header, const char* value );
 	void putheader( const char* header, int numericvalue );
 
-	// РѕС‚РїСЂР°РІРєР° Р·Р°РїСЂРѕСЃР° РїРѕСЃР»Рµ РґРѕР±Р°РІР»РµРЅРёСЏ РїРѕСЃР»РµРґРЅРµРіРѕ Р·Р°РіРѕР»РѕРІРєР°.
+	// отправка запроса после добавления последнего заголовка.
 	void endheaders();
 
-	// РѕС‚РїСЂР°РІРєР° РґР°РЅРЅС‹С…, РµСЃР»Рё РµСЃС‚СЊ.
-	// РІС‹Р·С‹РІР°РµС‚СЃСЏ РїРѕСЃР»Рµ endheaders()
+	// отправка данных, если есть.
+	// вызывается после endheaders()
 	void send( const unsigned char* buf, int numbytes );
 
 protected:
-	// РЅРµРѕР±С…РѕРґРёРјС‹Рµ РїРѕР»СЏ РґР»СЏ РєР»Р°СЃСЃР° Response
+	// необходимые поля для класса Response
 
-	// РєРѕР»Р±СЌРєРё
+	// колбэки
 	ResponseBegin_CB	m_ResponseBeginCB;
 	ResponseData_CB		m_ResponseDataCB;
 	ResponseComplete_CB	m_ResponseCompleteCB;
 	void*				m_UserData;
+	RequestBegin_CB		r_RequestBeginCB;
+	RequestData_CB		r_RequestDataCB;
+	RequestComplete_CB	r_RequestCompleteCB;
+	void*				r_UserData;
 
 private:
 	enum { IDLE, REQ_STARTED, REQ_SENT } m_State;
 	std::string m_Host;
 	int m_Port;
+	int m2_Port;
 	int m_Sock;
-	std::vector< std::string > m_Buffer;	// РЅР°Р±РѕСЂС‹ Р·Р°РїСЂРѕСЃРѕРІ
-
-	std::deque< Response* > m_Outstanding;	// РѕС‚РІРµС‚С‹ РґР»СЏ РЅРµРІС‹РїРѕР»РЅРµРЅРЅС‹С… Р·Р°РїСЂРѕСЃРѕРІ
+	int m2_Sock;
+	std::string m_Version;
+	std::string resp_done;
+	std::string req_done;
+	std::vector< std::string > r_Buffer;	// набора ответов
+	std::vector< std::string > m_Buffer;	// наборы запросов
+	bool gothost;
+	enum { NONE, DONE } resp_State;
+	enum { RESP, REQ } response_or_request;
+	bool first_time_connection;
+	bool gotacceptencoding;
+	std::deque< Request* > r_Outstanding;
+	std::deque< Response* > m_Outstanding;	// ответы для невыполненных запросов
 };
 
-
-
-
-
-
 //-------------------------------------------------
-// РєР»Р°СЃСЃ Response
+// класс Request
 //
-// РџР°СЂСЃРёРЅРі РґР°РЅРЅС‹С… РѕС‚РІРµС‚РѕРІ.
+// Парсинг данных запросов.
+// ------------------------------------------------
+class Request
+{
+	friend class Connection;
+	friend class ProxyServer;
+public:
+	// извлечь заголовок (возвращает 0, если отсутствует)
+	const char* getheader( const char* name ) const;
+
+	void setConnection(Connection* conn)
+	{
+		this->r_Connection = *conn;
+	}
+	bool completed() const
+	{ return r_State == COMPLETE; }
+
+	bool bodydone() const
+	{ return r_State == BODY||CHUNKLEN; }
+
+	std::string getmethod() const
+	{
+		return r_Method;
+	}
+	bool willclose() const
+	{ return r_WillClose; }
+	
+	Connection *getconnection() const
+	{
+		return &(this->r_Connection);
+	}
+
+	//int getstatus() const;
+protected:
+	Request( Connection& conn );
+
+	// достать данные для обработки.
+	// возвращает число использованных байт.
+	// Всегда 0, если ответ обработан.
+	int pump( const unsigned char* data, int datasize );
+
+	// предупредить о разорванном соединении
+	void notifyconnectionclosed();
+
+private:
+	enum {
+		METHODURL,		// начинаем со строки состояния.
+		HEADERS,		// читаем хэдеры
+		BODY,			// ожидаем данные тела ответа (все или часть)
+		CHUNKLEN,		// ожидание индикатора длины полученных данных (in hex)
+		CHUNKEND,		// ожидаем пустую строку после получения части данных (дальше могут идти доп. заголовки)
+		TRAILERS,		// чтение доп. заголовков (трейлеры) после тела ответа.
+		COMPLETE,		// ответ разобран
+	} r_State;
+
+	Connection& r_Connection;	// для доступа к указателям колбэков
+	std::string r_Method;		// методы: GET, POST и т.д.
+	std::string r_URL;
+	std::string r_VersionString;
+
+	std::vector<std::string> r_Headers;
+
+	int		r_BytesRead;		// число считанных байт тела ответа
+	bool	r_Chunked;			// разбит ли ответ на части?
+	int		r_ChunkLeft;		// оставшееся число байт в текущей части данных
+	int		r_Length;			// -1, если неизвестно
+	bool	r_WillClose;		// оборвать ли соединение после прихода ответа?
+	int		r_Version;
+	std::string r_LineBuf;		// сохранение строк для состояний
+	std::string r_HeaderAccum;	// буфер для заголовков
+	
+	void FlushHeader();
+	void ProcessMethodUrlLine( std::string const& line );
+	void ProcessHeaderLine( std::string const& line );
+	void ProcessTrailerLine( std::string const& line );
+	void ProcessChunkLenLine( std::string const& line );
+
+	int ProcessDataChunked( const unsigned char* data, int count );
+	int ProcessDataNonChunked( const unsigned char* data, int count );
+
+	void BeginBody();
+	bool CheckClose();
+	void Finish();
+};
+//-------------------------------------------------
+// класс Response
+//
+// Парсинг данных ответов.
 // ------------------------------------------------
 
 
 class Response
 {
 	friend class Connection;
+	friend class ProxyServer;
 public:
 
-	// РёР·РІР»РµС‡СЊ Р·Р°РіРѕР»РѕРІРѕРє (РІРѕР·РІСЂР°С‰Р°РµС‚ 0, РµСЃР»Рё РѕС‚СЃСѓС‚СЃС‚РІСѓРµС‚)
+	// извлечь заголовок (возвращает 0, если отсутствует)
 	const char* getheader( const char* name ) const;
 
 	bool completed() const
 		{ return m_State == COMPLETE; }
 
+	bool bodydone() const
+	{ return m_State == BODY||CHUNKLEN; }
 
-	// РёР·РІР»РµС‡СЊ СЃС‚Р°С‚СѓСЃ-РєРѕРґ
+	// извлечь статус-код
 	int getstatus() const;
 
-	// РёР·РІР»РµС‡СЊ reason-string
+	// извлечь reason-string
 	const char* getreason() const;
 
-	// true, РµСЃР»Рё СЃРѕРµРґРёРЅРµРЅРёРµ СЂР°Р·СЂС‹РІР°РµС‚СЃСЏ РїРѕСЃР»Рµ РїРѕР»СѓС‡РµРЅРёСЏ РѕС‚РІРµС‚Р°.
+	Connection *getconnection() const
+	{
+		return &(this->m_Connection);
+	}
+	// true, если соединение разрывается после получения ответа.
 	bool willclose() const
 		{ return m_WillClose; }
 protected:
-	// РёСЃРїРѕР»СЊР·СѓРµС‚СЃСЏ РѕР±СЉРµРєС‚Р°РјРё Connection
+	// используется объектами Connection
 
-	// С‚РѕР»СЊРєРѕ РѕР±СЉРµРєС‚С‹ РєР»Р°СЃСЃР° Connection СЃРѕР·РґР°СЋС‚ Response.
+	// только объекты класса Connection создают Response.
 	Response( const char* method, Connection& conn );
 
-	// РґРѕСЃС‚Р°С‚СЊ РґР°РЅРЅС‹Рµ РґР»СЏ РѕР±СЂР°Р±РѕС‚РєРё.
-	// РІРѕР·РІСЂР°С‰Р°РµС‚ С‡РёСЃР»Рѕ РёСЃРїРѕР»СЊР·РѕРІР°РЅРЅС‹С… Р±Р°Р№С‚.
-	// Р’СЃРµРіРґР° 0, РµСЃР»Рё РѕС‚РІРµС‚ РѕР±СЂР°Р±РѕС‚Р°РЅ.
+	// достать данные для обработки.
+	// возвращает число использованных байт.
+	// Всегда 0, если ответ обработан.
 	int pump( const unsigned char* data, int datasize );
 
-	// РїСЂРµРґСѓРїСЂРµРґРёС‚СЊ Рѕ СЂР°Р·РѕСЂРІР°РЅРЅРѕРј СЃРѕРµРґРёРЅРµРЅРёРё
+	// предупредить о разорванном соединении
 	void notifyconnectionclosed();
 
 private:
 	enum {
-		STATUSLINE,		// РЅР°С‡РёРЅР°РµРј СЃРѕ СЃС‚СЂРѕРєРё СЃРѕСЃС‚РѕСЏРЅРёСЏ.
-		HEADERS,		// С‡РёС‚Р°РµРј С…СЌРґРµСЂС‹
-		BODY,			// РѕР¶РёРґР°РµРј РґР°РЅРЅС‹Рµ С‚РµР»Р° РѕС‚РІРµС‚Р° (РІСЃРµ РёР»Рё С‡Р°СЃС‚СЊ)
-		CHUNKLEN,		// РѕР¶РёРґР°РЅРёРµ РёРЅРґРёРєР°С‚РѕСЂР° РґР»РёРЅС‹ РїРѕР»СѓС‡РµРЅРЅС‹С… РґР°РЅРЅС‹С… (in hex)
-		CHUNKEND,		// РѕР¶РёРґР°РµРј РїСѓСЃС‚СѓСЋ СЃС‚СЂРѕРєСѓ РїРѕСЃР»Рµ РїРѕР»СѓС‡РµРЅРёСЏ С‡Р°СЃС‚Рё РґР°РЅРЅС‹С… (РґР°Р»СЊС€Рµ РјРѕРіСѓС‚ РёРґС‚Рё РґРѕРї. Р·Р°РіРѕР»РѕРІРєРё)
-		TRAILERS,		// С‡С‚РµРЅРёРµ РґРѕРї. Р·Р°РіРѕР»РѕРІРєРѕРІ (С‚СЂРµР№Р»РµСЂС‹) РїРѕСЃР»Рµ С‚РµР»Р° РѕС‚РІРµС‚Р°.
-		COMPLETE,		// РѕС‚РІРµС‚ СЂР°Р·РѕР±СЂР°РЅ
+		STATUSLINE,		// начинаем со строки состояния.
+		HEADERS,		// читаем хэдеры
+		BODY,			// ожидаем данные тела ответа (все или часть)
+		CHUNKLEN,		// ожидание индикатора длины полученных данных (in hex)
+		CHUNKEND,		// ожидаем пустую строку после получения части данных (дальше могут идти доп. заголовки)
+		TRAILERS,		// чтение доп. заголовков (трейлеры) после тела ответа.
+		COMPLETE,		// ответ разобран
 	} m_State;
 
-	Connection& m_Connection;	// РґР»СЏ РґРѕСЃС‚СѓРїР° Рє СѓРєР°Р·Р°С‚РµР»СЏРј РєРѕР»Р±СЌРєРѕРІ
-	std::string m_Method;		// РјРµС‚РѕРґС‹: GET, POST Рё С‚.Рґ.
+	Connection& m_Connection;	// для доступа к указателям колбэков
+	std::string m_Method;		// методы: GET, POST и т.д.
 
-	// СЃС‚СЂРѕРєР° СЃРѕСЃС‚РѕСЏРЅРёСЏ
-	std::string	m_VersionString;	// РІРµСЂСЃРёСЏ РїСЂРѕС‚РѕРєРѕР»Р°
-	int	m_Version;			// 10: HTTP/1.0    11: HTTP/1.x (РіРґРµ x>=1)
-	int m_Status;			// РЎС‚Р°С‚СѓСЃ-РєРѕРґ
+	// строка состояния
+	std::string	m_VersionString;	// версия протокола
+	int	m_Version;			// 10: HTTP/1.0    11: HTTP/1.x (где x>=1)
+	int m_Status;			// Статус-код
 	std::string m_Reason;	// reason-string
 
-	// РєР°СЂС‚Р° РїР°СЂ Р·Р°РіРѕР»РѕРІРѕРє/Р·РЅР°С‡РµРЅРёРµ
+	// карта пар заголовок/значение
 	std::map<std::string,std::string> m_Headers;
 
-	int		m_BytesRead;		// С‡РёСЃР»Рѕ СЃС‡РёС‚Р°РЅРЅС‹С… Р±Р°Р№С‚ С‚РµР»Р° РѕС‚РІРµС‚Р°
-	bool	m_Chunked;			// СЂР°Р·Р±РёС‚ Р»Рё РѕС‚РІРµС‚ РЅР° С‡Р°СЃС‚Рё?
-	int		m_ChunkLeft;		// РѕСЃС‚Р°РІС€РµРµСЃСЏ С‡РёСЃР»Рѕ Р±Р°Р№С‚ РІ С‚РµРєСѓС‰РµР№ С‡Р°СЃС‚Рё РґР°РЅРЅС‹С…
-	int		m_Length;			// -1, РµСЃР»Рё РЅРµРёР·РІРµСЃС‚РЅРѕ
-	bool	m_WillClose;		// РѕР±РѕСЂРІР°С‚СЊ Р»Рё СЃРѕРµРґРёРЅРµРЅРёРµ РїРѕСЃР»Рµ РїСЂРёС…РѕРґР° РѕС‚РІРµС‚Р°?
-
-	std::string m_LineBuf;		// СЃРѕС…СЂР°РЅРµРЅРёРµ СЃС‚СЂРѕРє РґР»СЏ СЃРѕСЃС‚РѕСЏРЅРёР№
-	std::string m_HeaderAccum;	// Р±СѓС„РµСЂ РґР»СЏ Р·Р°РіРѕР»РѕРІРєРѕРІ
+	int		m_BytesRead;		// число считанных байт тела ответа
+	bool	m_Chunked;			// разбит ли ответ на части?
+	int		m_ChunkLeft;		// оставшееся число байт в текущей части данных
+	int		m_Length;			// -1, если неизвестно
+	bool	m_WillClose;		// оборвать ли соединение после прихода ответа?
+	bool	cache_allowed;		// разрешить кеширование
+	std::string m_LineBuf;		// сохранение строк для состояний
+	std::string m_HeaderAccum;	// буфер для заголовков
 
 
 	void FlushHeader();
@@ -318,6 +510,6 @@ private:
 }
 
 
-#endif // httpparser_H
+#endif // ParserHeader_H
 
 
